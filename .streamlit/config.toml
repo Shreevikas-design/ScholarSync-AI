@@ -1,0 +1,10 @@
+# Local Streamlit configuration for the D-drive project.
+[global]
+showWarningOnDirectExecution = false
+
+[server]
+headless = true
+maxUploadSize = 25
+
+[client]
+toolbarMode = "minimal"

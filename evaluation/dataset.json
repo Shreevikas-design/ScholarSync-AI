@@ -1,0 +1,18 @@
+{
+  "dataset_name": "ScholarSync academic search relevance seed v1",
+  "judgment_policy": "Positive IDs were manually selected from the paper identity and abstract pages cited below. Relevance labels are query-specific and should be reviewed before portfolio benchmark claims. The evaluation script reports live retrieval metrics only; no result scores are stored here.",
+  "cases": [
+    {
+      "query": "Wi-Fi access point location and frequency assignment",
+      "relevant_ids": ["arxiv:1101.5027"],
+      "evidence_url": "https://arxiv.org/abs/1101.5027",
+      "note": "The abstract describes AP location and frequency assignment as Wi-Fi network planning tasks."
+    },
+    {
+      "query": "placement optimization of energy and information access points in wireless powered communication networks",
+      "relevant_ids": ["arxiv:1505.06530"],
+      "evidence_url": "https://arxiv.org/abs/1505.06530",
+      "note": "The abstract studies placement optimization for energy nodes and information access points in wireless powered communication networks."
+    }
+  ]
+}
