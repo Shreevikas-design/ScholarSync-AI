@@ -29,6 +29,7 @@ class PDFResult:
     pages: list[PageText]
     metadata: dict[str, str]
     error: str | None = None
+    truncated: bool = False
 
 
 def _public_http_url(url: str) -> bool:
@@ -43,7 +44,30 @@ def _public_http_url(url: str) -> bool:
 
 
 def clean_text(text: str) -> str:
-    return " ".join(text.replace(chr(0), " ").split())
+    lines = [" ".join(line.replace(chr(0), " ").split()) for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def _remove_repeated_marginalia(pages: list[PageText]) -> list[PageText]:
+    if len(pages) < 3:
+        return pages
+    counts: dict[str, int] = {}
+    for page in pages:
+        lines = page.text.splitlines()
+        for line in set(lines[:2] + lines[-2:]):
+            normalized = " ".join(line.casefold().split())
+            if len(normalized) >= 5:
+                counts[normalized] = counts.get(normalized, 0) + 1
+    threshold = max(3, int(len(pages) * 0.4))
+    repeated = {line for line, count in counts.items() if count >= threshold}
+    if not repeated:
+        return pages
+    cleaned = []
+    for page in pages:
+        lines = page.text.splitlines()
+        kept = [line for line in lines if " ".join(line.casefold().split()) not in repeated]
+        cleaned.append(PageText(page=page.page, text="\n".join(kept)))
+    return [page for page in cleaned if page.text.strip()]
 
 
 def extract_pdf_bytes(data: bytes, settings: Settings, target: Path | None = None) -> PDFResult:
@@ -55,12 +79,15 @@ def extract_pdf_bytes(data: bytes, settings: Settings, target: Path | None = Non
                 return PDFResult(False, None, [], {}, "Encrypted PDF cannot be processed.")
             metadata = {k: str(v or "") for k, v in (doc.metadata or {}).items() if v}
             pages = []
+            page_count = doc.page_count
+            truncated = page_count > settings.max_pdf_pages
             for index, page in enumerate(doc, start=1):
                 if index > settings.max_pdf_pages:
                     break
                 text = clean_text(page.get_text("text"))
                 if text:
                     pages.append(PageText(page=index, text=text))
+            pages = _remove_repeated_marginalia(pages)
             if not pages:
                 return PDFResult(False, None, [], metadata, "PDF contains no extractable text.")
         saved = None
@@ -68,7 +95,8 @@ def extract_pdf_bytes(data: bytes, settings: Settings, target: Path | None = Non
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
             saved = str(target)
-        return PDFResult(True, saved, pages, metadata)
+        warning = f"PDF page limit reached; extracted the first {settings.max_pdf_pages} of {page_count} pages." if truncated else None
+        return PDFResult(True, saved, pages, metadata, error=warning, truncated=truncated)
     except Exception as exc:
         log.info("PDF extraction failed: %s", type(exc).__name__)
         return PDFResult(False, None, [], {}, f"Invalid or unreadable PDF ({type(exc).__name__}).")

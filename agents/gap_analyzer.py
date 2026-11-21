@@ -23,8 +23,12 @@ class ResearchGapAnalyzer:
                         related_paper_ids=[analysis.paper_id],
                         why_it_matters="The paper itself identifies this constraint, which bounds how its findings should be interpreted.",
                         proposed_direction=analysis.future_work if analysis.future_work != "Not reported in accessible text." else "Treat this as a candidate direction; the accessible text does not state a specific follow-up.",
-                        confidence="high" if analysis.analysis_mode == "full-text" else "medium",
-                        confidence_explanation=f"Quoted author text supports this limitation; analysis used {analysis.analysis_mode}.",
+                        confidence="low",
+                        confidence_explanation=(
+                            f"One included paper explicitly reports this limitation ({analysis.analysis_mode}); "
+                            "single-paper evidence is limited and does not establish a cross-paper gap."
+                        ),
+                        evidence_coverage=1.0 / max(1, len(analyses)),
                     ))
         groups: dict[str, list[EvidenceSpan]] = {}
         for analysis in analyses:
@@ -40,6 +44,7 @@ class ResearchGapAnalyzer:
         for evidence in groups.values():
             paper_ids = list(dict.fromkeys(e.paper_id for e in evidence))
             if len(paper_ids) >= 2:
+                confidence = "high" if len(paper_ids) >= 3 else "medium"
                 gaps.append(ResearchGap(
                     gap_id=f"CG-{len(gaps)+1:02d}",
                     title="Repeated author-reported limitation",
@@ -49,8 +54,12 @@ class ResearchGapAnalyzer:
                     related_paper_ids=paper_ids,
                     why_it_matters="A limitation reported independently in multiple included papers may constrain the evidence represented by this corpus.",
                     proposed_direction="Compare the affected conditions across the cited papers and evaluate a remedy under matched experimental conditions.",
-                    confidence="medium",
-                    confidence_explanation="At least two distinct paper IDs provide matching limitation evidence; corpus coverage remains limited.",
+                    confidence=confidence,
+                    confidence_explanation=(
+                        f"{len(paper_ids)} distinct included papers provide matching limitation evidence; "
+                        "confidence is limited to this retrieved corpus and its coverage."
+                    ),
+                    evidence_coverage=len(paper_ids) / max(1, len(analyses)),
                 ))
         dataset_evidence = []
         dataset_paper_ids = []
@@ -80,5 +89,6 @@ class ResearchGapAnalyzer:
                 proposed_direction="Replicate the reported methods on a documented shared benchmark with common metrics and conditions.",
                 confidence="low",
                 confidence_explanation="This hypothesis is generated from distinct dataset statements in a small retrieved corpus; it needs domain review and broader search.",
+                evidence_coverage=len(set(dataset_paper_ids)) / max(1, len(analyses)),
             ))
         return gaps

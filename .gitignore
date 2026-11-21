@@ -9,6 +9,8 @@ __pycache__/
 .pytest_cache/
 data/cache/
 data/papers/
+data/models/
+# Legacy local vector cache; the application now uses isolated in-memory collections.
 data/chroma/
 data/reports/
 .streamlit/secrets.toml

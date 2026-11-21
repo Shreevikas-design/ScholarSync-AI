@@ -12,9 +12,10 @@ ScholarSync is not a general chatbot. Search results and citations come from Ope
 - Separate research planner, discovery, paper analysis, comparative analysis, gap analysis, writer, evidence critic, and citation validation stages.
 - LangGraph conditional revision loop capped at two re-drafts.
 - Abstract-only analysis labels and exact evidence excerpts.
-- ChromaDB semantic retrieval with Ollama or optional Sentence Transformers embeddings, plus lexical retrieval when semantic indexing is unavailable.
+- Embedded ChromaDB semantic retrieval with a lazy bundled ONNX embedding model by default; Ollama or Sentence Transformers can be selected explicitly. Reciprocal-rank fusion combines semantic and keyword ranks, and fallback mode is displayed.
+- Session-isolated vector collections shared by paper analysis and Research Chat; uploaded PDFs are chunked with page, DOI, source, title, and paper ID metadata.
 - Paper chat returns retrieved source excerpts with paper titles and page numbers when those pages exist.
-- Markdown, PDF, and BibTeX exports.
+- Markdown, PDF, BibTeX, paper-metadata JSON, and research-gap JSON exports.
 - Live retrieval evaluation against a small manually judged seed dataset.
 - Workflow event log, API failure counts, LLM call/token usage where providers report them, and prompt-budget protection.
 
@@ -35,7 +36,7 @@ See docs/architecture.md for modules, state fields, boundaries, and the workflow
 | Literature Review Writer | Builds the required report sections from collected metadata and evidence. |
 | Evidence Critic | Checks structure, evidence IDs, abstract-only labels, and citation validity; requests at most two revisions. |
 
-Agents are Python modules and use Pydantic schemas. Template mode is deterministic and transparent. Ollama or Groq can be selected for planning and paper analysis. The literature review remains evidence-template based so provider prose cannot add uncited facts.
+Agents are Python modules and use Pydantic schemas. Template mode is deterministic and transparent. Ollama or Groq can be selected for planning and paper analysis. If configured, the literature writer adds a bounded synthesis call using compact paper summaries and quote references; unsupported or invalid synthesis is rejected in favor of the deterministic evidence summary.
 
 ## Workflow
 
@@ -44,10 +45,10 @@ Agents are Python modules and use Pydantic schemas. Template mode is determinist
       -> OpenAlex / arXiv / Crossref
       -> Normalize, deduplicate, filter, rank
       -> Public PDF retrieval
-      -> Parallel paper analysis and page-aware chunks
+      -> Parallel paper analysis and page-aware chunks into the session vector collection
       -> Comparison
       -> Evidence-supported gap analysis
-      -> Report writer
+      -> Deterministic report structure plus optional validated LLM synthesis
       -> Evidence critic -- revise at most twice --> Report writer
       -> Citation validation
       -> Report and paper chat
@@ -86,7 +87,18 @@ To keep large model weights on D, set OLLAMA_MODELS to D:\ScholarSync_AI\models\
 
 ## Groq setup
 
-Set SCHOLARSYNC_GROQ_API_KEY in the process environment or enter it in the password field after selecting Groq. The key is never persisted by the UI or written to logs. Groq is optional; no paid API is needed for template mode.
+Set SCHOLARSYNC_GROQ_API_KEY in the process environment or enter it in the password field after selecting Groq. The key is never persisted by the UI or written to logs. Groq is optional; no paid API is needed for template mode. An optional OpenAlex API key can be provided with SCHOLARSYNC_OPENALEX_API_KEY or in Settings to help with provider rate limits.
+
+## Streamlit Community Cloud
+
+The cloud app uses embedded Chroma collections and does not need a laptop-hosted Chroma or Ollama server. The bundled ONNX embedding model initializes only when a paper is first indexed; if model download or initialization fails, chat explicitly falls back to keyword retrieval. Add optional provider secrets in the app's Streamlit Cloud Secrets settings, for example:
+
+```toml
+SCHOLARSYNC_GROQ_API_KEY = "..."
+SCHOLARSYNC_OPENALEX_API_KEY = "..."
+```
+
+Uploaded PDFs and vector records are session-scoped and are not durable across session termination or a Cloud restart. Public search metadata and downloaded PDFs use the app's configured runtime data directory.
 
 ## Environment variables
 
@@ -97,15 +109,17 @@ Set SCHOLARSYNC_GROQ_API_KEY in the process environment or enter it in the passw
 | SCHOLARSYNC_OLLAMA_MODEL | Ollama generation model | qwen2.5:7b |
 | SCHOLARSYNC_OLLAMA_EMBED_MODEL | Ollama embedding model | nomic-embed-text |
 | SCHOLARSYNC_GROQ_API_KEY | Optional Groq key | unset |
+| SCHOLARSYNC_OPENALEX_API_KEY | Optional OpenAlex API key | unset |
+| SCHOLARSYNC_EMBEDDING_PROVIDER | chroma-default, ollama, or sentence-transformers | chroma-default |
 | SCHOLARSYNC_GROQ_MODEL | Groq generation model | openai/gpt-oss-20b |
 | SCHOLARSYNC_MAX_CONTEXT_TOKENS | Prompt context ceiling; preflight checked | 8192 |
 | SCHOLARSYNC_MAX_OUTPUT_TOKENS | Generation output cap | 1200 |
 | SCHOLARSYNC_REQUEST_TIMEOUT | API timeout, seconds | 45 |
-| SCHOLARSYNC_DATA_DIR | Data/cache/vector path | ./data |
+| SCHOLARSYNC_DATA_DIR | Search cache, downloaded PDFs, and report path; vectors are session-memory only | ./data |
 | SCHOLARSYNC_CACHE_TTL_HOURS | Search cache TTL; 0 disables cache | 24 |
 | SCHOLARSYNC_MAX_PDF_MB | PDF download limit | 25 |
 | SCHOLARSYNC_MAX_PDF_PAGES | Extraction page limit | 200 |
-| SCHOLARSYNC_MAX_RETRIES | Bounded retries for transient failures | 2 |
+| SCHOLARSYNC_MAX_RETRIES | Bounded academic API retries; LLM calls remain capped at two attempts | 2 |
 
 ## Usage
 
@@ -127,7 +141,7 @@ See docs/evaluation.md. Retrieval metrics compare live API results with two manu
 
 ## Limitations
 
-See docs/limitations.md. Public API indexing is incomplete; many papers are paywalled; abstract extraction is not full-paper review; token estimates are approximate; embeddings require an explicitly selected backend; and automated gap detection is conservative.
+See docs/limitations.md. Public API indexing is incomplete; many papers are paywalled; abstract extraction is not full-paper review; token estimates are approximate; the bundled embedding model downloads on first use; uploaded papers and vector collections are session-scoped; and automated gap detection is conservative.
 
 ## Documentation
 

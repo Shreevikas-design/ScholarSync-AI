@@ -9,9 +9,11 @@ import pytest
 from evaluation.metrics import mean_reciprocal_rank, precision_at_k, recall_at_k
 from schemas.models import EvidenceSpan
 from services.citation_service import bibtex_export, citation_map, validate_citations
+from services.chat_service import answer_from_papers
 from services.embedding_service import EmbeddingService
 from services.llm_service import LLMService, ProviderError, TokenBudgetError
 from services.pdf_service import _public_http_url, download_pdf, extract_pdf_bytes
+from agents.paper_analyzer import _body_pages
 from services.report_service import export_pdf, safe_filename
 from services.retrieval_service import chunk_pages, hybrid_retrieve, keyword_retrieve
 from services.vector_service import VectorService
@@ -29,6 +31,20 @@ def test_pdf_extracts_page_text_and_metadata(settings_factory):
     assert "Wi-Fi planning" in result.pages[0].text
 
 
+def test_pdf_page_limit_is_reported_as_partial_text(settings_factory):
+    doc = fitz.open()
+    for index in range(2):
+        page = doc.new_page()
+        page.insert_text((72, 72), f"Study body page {index + 1} contains unique evidence.")
+    data = doc.tobytes()
+    doc.close()
+    result = extract_pdf_bytes(data, settings_factory(max_pdf_pages=1))
+    assert result.ok and result.truncated
+    assert len(result.pages) == 1
+    assert result.error
+    assert "first 1 of 2 pages" in result.error
+
+
 def test_pdf_rejects_invalid_file(settings_factory):
     result = extract_pdf_bytes(b"not a pdf", settings_factory())
     assert not result.ok
@@ -39,6 +55,15 @@ def test_pdf_rejects_oversize_file(settings_factory):
     result = extract_pdf_bytes(b"x" * (1024 * 1024 + 1), settings_factory(max_pdf_mb=1))
     assert not result.ok
     assert "size limit" in result.error
+
+
+def test_paper_body_filter_stops_at_references_section():
+    pages = [
+        {"page": 1, "text": "Study body with a verified result.\nReferences"},
+        {"page": 2, "text": "A bibliography item with unrelated evidence."},
+    ]
+    body = _body_pages(pages)
+    assert body == [{"page": 1, "text": "Study body with a verified result."}]
 
 
 def test_pdf_rejects_local_url():
@@ -109,9 +134,10 @@ def test_page_aware_chunking_and_keyword_retrieval(real_paper):
 
 def test_hybrid_retrieval_exposes_semantic_fallback(real_paper):
     chunks = chunk_pages(real_paper, [{"page": None, "location": "abstract", "text": real_paper.abstract}])
-    results, warning = hybrid_retrieve("frequency assignment", chunks)
+    results, mode, warning = hybrid_retrieve("frequency assignment", chunks)
     assert results
-    assert warning is None
+    assert mode == "keyword"
+    assert warning and "keyword retrieval" in warning
 
 
 def test_vector_service_batches_embeddings_and_preserves_metadata(settings_factory):
@@ -141,6 +167,67 @@ def test_vector_service_batches_embeddings_and_preserves_metadata(settings_facto
     assert rows[0]["metadata"]["paper_id"] == "paper-4"
     assert rows[0]["metadata"]["page"] == 5
     assert rows[0]["metadata"]["source_url"] == "https://example.org/4"
+    before_duplicate_add = list(embedder.batch_lengths)
+    assert service.add(chunks, batch_size=2) == 0
+    assert embedder.batch_lengths == before_duplicate_add
+
+
+def test_vector_collections_are_isolated_between_sessions(settings_factory):
+    class Embedder:
+        def embed(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+    first = VectorService(settings_factory(), embedder=Embedder())
+    second = VectorService(settings_factory(), embedder=Embedder())
+    chunk = {"chunk_id": "private-chunk", "text": "session-specific evidence", "metadata": {"paper_id": "paper-a", "title": "A", "doi": "", "source": "test", "page": 1}}
+    first.add([chunk])
+    assert first.collection_name != second.collection_name
+    assert second.query("session-specific evidence", paper_ids=["paper-a"]) == []
+    first.cleanup()
+    second.cleanup()
+
+
+def test_hybrid_retrieval_reports_mode_and_uses_rank_fusion(real_paper):
+    chunks = chunk_pages(real_paper, [{"page": 1, "text": "Wi-Fi access point optimization evidence."}])
+    class Semantic:
+        def query(self, *args, **kwargs):
+            return [{**chunks[0], "score": 0.01}]
+    rows, mode, warning = hybrid_retrieve("Wi-Fi access point", chunks, Semantic())
+    assert rows and mode == "hybrid" and warning is None
+    rows, mode, warning = hybrid_retrieve("Wi-Fi access point", chunks, object())
+    assert rows and mode == "keyword-fallback" and "Semantic retrieval failed" in warning
+
+
+def test_chat_respects_selected_papers_and_labels_retrieval(real_paper):
+    other = real_paper.model_copy(update={"paper_id": "arxiv:other", "title": "Other paper", "abstract": "Battery methods and measurements."})
+    chunks = chunk_pages(real_paper, [{"page": None, "location": "abstract", "text": real_paper.abstract}])
+    chunks += chunk_pages(other, [{"page": None, "location": "abstract", "text": other.abstract}])
+    response = answer_from_papers("frequency assignment", [real_paper, other], chunks, selected_paper_ids=[real_paper.paper_id])
+    assert response["retrieval_mode"] == "keyword"
+    assert response["evidence"]
+    assert {item["paper_id"] for item in response["evidence"]} == {real_paper.paper_id}
+    empty = answer_from_papers("frequency assignment", [real_paper], chunks, selected_paper_ids=[])
+    assert not empty["evidence"] and empty["answer"].startswith("I do not have sufficient")
+
+
+def test_chat_synthesis_requires_exact_retrieved_citations(settings_factory, real_paper):
+    from services.chat_service import ChatAnswer, ChatCitation
+    chunks = chunk_pages(real_paper, [{"page": 7, "text": "The method uses a documented frequency assignment optimization approach."}])
+    quote = chunks[0]["text"]
+    class FakeLLM:
+        def __init__(self, citation_quote):
+            self.settings = settings_factory(provider="groq")
+            self.citation_quote = citation_quote
+        def generate_json(self, *args, **kwargs):
+            return ChatAnswer(answer="The excerpt describes an optimization approach.", citations=[
+                ChatCitation(paper_id=real_paper.paper_id, quote=self.citation_quote)
+            ])
+    good = answer_from_papers("frequency assignment method", [real_paper], chunks, llm_service=FakeLLM(quote))
+    assert good["answer_mode"] == "LLM synthesis with retrieved citations"
+    assert "p. 7" in good["answer"]
+    bad = answer_from_papers("frequency assignment method", [real_paper], chunks, llm_service=FakeLLM("invented citation text"))
+    assert bad["answer_mode"] == "extractive evidence"
+    assert bad["warning"] and "shown instead" in bad["warning"]
 
 
 def test_citation_validation_and_bibtex(real_paper):
@@ -163,6 +250,25 @@ def test_llm_provider_selection_does_not_silently_fallback(settings_factory):
     template = LLMService(settings_factory(provider="template"))
     with pytest.raises(ProviderError, match="Template mode"):
         template.complete_text("prompt")
+
+
+def test_unreachable_ollama_is_circuit_broken_after_bounded_attempts(settings_factory, monkeypatch):
+    calls = []
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def post(self, *args, **kwargs):
+            calls.append(1)
+            raise __import__("httpx").ConnectError("offline")
+    monkeypatch.setattr("httpx.Client", Client)
+    monkeypatch.setattr("services.llm_service.time.sleep", lambda *_: None)
+    llm = LLMService(settings_factory(provider="ollama", max_retries=5))
+    with pytest.raises(ProviderError, match="network/timeout"):
+        llm.complete_text("brief prompt")
+    with pytest.raises(ProviderError, match="no further Ollama calls"):
+        llm.complete_text("another prompt")
+    assert len(calls) == 2
 
 
 def test_token_context_preflight(settings_factory):
@@ -194,6 +300,15 @@ def test_provider_500_token_overflow_is_classified(settings_factory, monkeypatch
     assert llm.usage.failed_calls == 1
     assert llm.usage.llm_calls == 1
     assert "too many tokens" not in llm.usage.errors[0]
+
+
+def test_invalid_structured_output_is_counted_as_failed(settings_factory, monkeypatch):
+    llm = LLMService(settings_factory(provider="groq", groq_api_key="test-secret"))
+    monkeypatch.setattr(llm, "_request", lambda *_args, **_kwargs: ("not JSON", {}))
+    with pytest.raises(ProviderError, match="validation"):
+        llm.generate_json("extract evidence", EvidenceSpan)
+    assert llm.usage.failed_calls == 1
+    assert llm.usage.errors == ["invalid structured output"]
 
 
 def test_sentence_transformer_selection_is_explicit(settings_factory):

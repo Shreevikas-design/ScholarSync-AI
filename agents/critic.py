@@ -17,6 +17,10 @@ class EvidenceCritic:
                 issues.append(CriticIssue(severity="error", message="Analysis references a paper outside the discovered corpus."))
             if analysis.analysis_mode == "abstract-only" and "abstract-only" not in report.markdown.casefold():
                 issues.append(CriticIssue(severity="error", message="Abstract-only analysis was not labelled in the report."))
+            if analysis.analysis_mode == "metadata-only" and "metadata-only" not in report.markdown.casefold():
+                issues.append(CriticIssue(severity="error", message="Metadata-only analysis was not labelled in the report."))
+            if analysis.analysis_mode == "partial-full-text" and "partial full-text" not in report.markdown.casefold():
+                issues.append(CriticIssue(severity="error", message="Page-limited full-text analysis was not labelled in the report."))
             source = next((paper for paper in papers if paper.paper_id == analysis.paper_id), None)
             for evidence in analysis.evidence:
                 if evidence.paper_id not in known or not evidence.quote:
@@ -38,12 +42,14 @@ class EvidenceCritic:
         invalid = validate_citations(report.markdown, papers)
         if invalid:
             issues.append(CriticIssue(severity="error", message="Report contains citation numbers without a matching collected paper: " + ", ".join(sorted(set(invalid)))))
-        missing_refs = [f"[{i}]" for i in range(1, len(papers) + 1) if f"[{i}]" not in report.markdown]
+        report_body = report.markdown.split("## References", 1)[0]
+        missing_refs = [f"[{i}]" for i in range(1, len(papers) + 1) if f"[{i}]" not in report_body]
         if papers and missing_refs:
-            issues.append(CriticIssue(severity="warning", message="Some collected references are not cited in the report: " + ", ".join(missing_refs)))
-        required = ("Abstract", "Introduction", "Research background", "Literature review", "Methodological comparison",
+            issues.append(CriticIssue(severity="error", message="Some collected references are not cited in the report body: " + ", ".join(missing_refs)))
+        required = ("Abstract", "Introduction", "Research background", "Literature review", "Thematic literature synthesis", "Methodological comparison",
                     "Cross-paper synthesis", "Major findings", "Research limitations", "Research gaps",
-                    "Future research directions", "Conclusion", "References")
+                    "Future research directions", "Conclusion", "References", "Review methodology",
+                    "Limitations of this review")
         for heading in required:
             if heading.casefold() not in report.markdown.casefold():
                 issues.append(CriticIssue(severity="error", message=f"Required report section is missing: {heading}."))

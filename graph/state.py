@@ -26,6 +26,7 @@ class ResearchState(TypedDict, total=False):
     search_errors: list[str]
     api_calls: int
     failed_api_calls: int
+    provider_status: dict[str, dict[str, Any]]
     llm_usage: dict[str, Any]
     chunks: list[dict[str, Any]]
     source_texts: dict[str, list[dict[str, Any]]]

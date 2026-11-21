@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 from config import Settings
 from graph.workflow import build_workflow
 from schemas.models import WorkflowEvent
+from services.vector_service import VectorService
 
 
 class ResearchRequest(BaseModel):
@@ -30,11 +31,20 @@ class ResearchRequest(BaseModel):
 class Supervisor:
     """Validates resource bounds, invokes the graph, and returns complete run state."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, vector_service: VectorService | None = None):
         self.settings = settings
+        self.vector_service = vector_service
 
-    def run(self, request: ResearchRequest, on_event: Callable[[WorkflowEvent], None] | None = None) -> dict:
-        graph = build_workflow(self.settings, on_event=on_event)
+    def run(
+        self,
+        request: ResearchRequest,
+        on_event: Callable[[WorkflowEvent], None] | None = None,
+        reuse_result: dict | None = None,
+    ) -> dict:
+        graph = build_workflow(
+            self.settings, on_event=on_event, vector_service=self.vector_service,
+            reuse_result=reuse_result,
+        )
         return graph.invoke(
             {
                 **request.model_dump(),

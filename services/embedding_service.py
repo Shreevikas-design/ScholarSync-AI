@@ -1,6 +1,31 @@
 from __future__ import annotations
 
+import threading
+from functools import lru_cache
+from pathlib import Path
+
 from config import Settings
+
+_MODEL_LOCK = threading.RLock()
+
+
+@lru_cache(maxsize=2)
+def _onnx_embedder(cache_dir: str):
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import ONNXMiniLM_L6_V2
+
+    model_cache = Path(cache_dir) / "all-MiniLM-L6-v2"
+
+    class ScholarSyncMiniLM(ONNXMiniLM_L6_V2):
+        DOWNLOAD_PATH = model_cache
+
+    return ScholarSyncMiniLM()
+
+
+@lru_cache(maxsize=2)
+def _sentence_transformer(model_name: str):
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(model_name)
 
 
 class EmbeddingService:
@@ -11,6 +36,17 @@ class EmbeddingService:
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
+        if self.settings.embedding_provider == "chroma-default":
+            try:
+                model = _onnx_embedder(str(self.settings.data_dir / "models" / "embeddings"))
+                with _MODEL_LOCK:
+                    vectors = model(texts)
+                return [vector.tolist() if hasattr(vector, "tolist") else list(vector) for vector in vectors]
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Embedded Chroma ONNX embeddings unavailable ({type(exc).__name__}). "
+                    "Keyword retrieval remains available; check model-download access and onnxruntime."
+                ) from exc
         if self.settings.embedding_provider == "ollama":
             import httpx
 
@@ -41,11 +77,13 @@ class EmbeddingService:
                 raise RuntimeError("Ollama returned an invalid embedding response.")
             return vectors
         try:
-            from sentence_transformers import SentenceTransformer
+            model = _sentence_transformer(self.settings.sentence_transformer_model)
         except ImportError as exc:
             raise RuntimeError(
                 "Sentence Transformers is selected but optional package sentence-transformers is not installed."
             ) from exc
         if self._model is None:
-            self._model = SentenceTransformer(self.settings.sentence_transformer_model)
-        return self._model.encode(texts, normalize_embeddings=True).tolist()
+            self._model = model
+        with _MODEL_LOCK:
+            vectors = self._model.encode(texts, normalize_embeddings=True)
+        return vectors.tolist()

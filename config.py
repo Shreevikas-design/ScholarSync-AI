@@ -18,9 +18,10 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen2.5:7b"
     ollama_embed_model: str = "nomic-embed-text"
+    openalex_api_key: SecretStr | None = None
     groq_api_key: SecretStr | None = None
     groq_model: str = "openai/gpt-oss-20b"
-    embedding_provider: Literal["ollama", "sentence-transformers"] = "ollama"
+    embedding_provider: Literal["chroma-default", "ollama", "sentence-transformers"] = "chroma-default"
     sentence_transformer_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     max_context_tokens: int = Field(default=8192, ge=1024, le=131072)
     max_output_tokens: int = Field(default=1200, ge=128, le=8192)
@@ -44,7 +45,7 @@ class Settings(BaseSettings):
         return value.rstrip("/")
 
     def ensure_data_dirs(self) -> None:
-        for name in ("cache", "papers", "chroma", "reports"):
+        for name in ("cache", "papers", "reports", "models/embeddings"):
             (self.data_dir / name).mkdir(parents=True, exist_ok=True)
 
 

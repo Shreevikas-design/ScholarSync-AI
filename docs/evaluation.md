@@ -4,11 +4,11 @@
 
 evaluation/dataset.json contains two query-specific positive relevance judgments, each pointing to the corresponding arXiv abstract page. The evaluator searches live public APIs using the topic planner and computes Precision@K, Recall@K, and MRR. API failures, call counts, and elapsed search time are reported.
 
-Judgments are manually seeded and intentionally small. They should be expanded by domain reviewers before making portfolio claims about general retrieval quality. Metrics are computed at runtime and are not hardcoded or represented as results from a prior run.
+Judgments are manually seeded and intentionally small. Retrieved identifiers are matched across canonical DOI/arXiv IDs and source aliases, including arXiv URLs. Every query reports retrieved IDs, relevant IDs, matched IDs, provider status, and its score. Queries with no ground truth or no usable retrieval are marked unscorable/incomplete rather than displayed as fabricated zeroes. Aggregate metrics average only scoreable cases. The seed should be expanded by domain reviewers before making portfolio claims about general retrieval quality. Metrics are computed at runtime and are not hardcoded or represented as results from a prior run.
 
 ## Generation and evidence
 
-The metrics module includes citation validity, evidence coverage, groundedness, and unsupported-claim count. Exact quote matching is auditable and repeatable, but it is stricter than semantic entailment and can miss a valid paraphrase. Groundedness from exact-string checks is a mechanical estimate, not a human or LLM-as-judge score.
+The metrics module includes citation validity, evidence coverage, groundedness, and unsupported-claim count. Exact quote matching is auditable and repeatable, but it is stricter than semantic entailment and can miss a valid paraphrase. Groundedness from exact-string checks is a mechanical estimate, not a human or LLM-as-judge score. Optional LLM synthesis requires evidence references that resolve to validated paper quotes; this is a traceability check, not proof of semantic entailment.
 
 ## System measurements
 

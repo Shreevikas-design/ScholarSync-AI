@@ -8,8 +8,21 @@ import re
 def norm_doi(value: str | None) -> str | None:
     if not value:
         return None
-    value = re.sub(r"^https?://(dx\.)?doi\.org/", "", value.strip(), flags=re.I)
-    return value.casefold() or None
+    value = value.strip()
+    value = re.sub(r"^(?:doi\s*:\s*|https?://(?:dx\.)?doi\.org/)", "", value, flags=re.I)
+    value = value.strip().rstrip(".,;)]}>").casefold()
+    return value if re.match(r"^10\.\d{4,9}/\S+$", value) else None
+
+
+def norm_arxiv(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = value.strip().casefold()
+    value = re.sub(r"^https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/", "", value)
+    value = re.sub(r"^arxiv\s*:\s*", "", value)
+    value = value.split("?", 1)[0].removesuffix(".pdf")
+    value = re.sub(r"v\d+$", "", value)
+    return value if re.fullmatch(r"(?:\d{4}\.\d{4,5}|[a-z-]+/\d{7})", value) else None
 
 
 def abstract_from_index(index: dict[str, list[int]] | None) -> str:

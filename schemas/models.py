@@ -28,7 +28,7 @@ class Paper(BaseModel):
     source_ids: list[str] = Field(default_factory=list)
     is_preprint: bool = False
     relevance_score: float = Field(default=0.0, ge=0.0, le=1.0)
-    full_text_status: Literal["not-fetched", "full-text", "abstract-only", "failed"] = "not-fetched"
+    full_text_status: Literal["not-fetched", "full-text", "partial-full-text", "abstract-only", "metadata-only", "failed"] = "not-fetched"
     published_date: str | None = None
 
     @field_validator("title")
@@ -50,13 +50,15 @@ class EvidenceSpan(BaseModel):
 
 class PaperAnalysis(BaseModel):
     paper_id: str
-    analysis_mode: Literal["full-text", "abstract-only"]
+    analysis_mode: Literal["full-text", "partial-full-text", "abstract-only", "metadata-only"]
     objective: str
     problem_statement: str
     methodology: str
     algorithm_model: str
     computational_complexity: str
     dataset: str
+    sensor_types: str = "Not reported in accessible text."
+    feature_extraction: str = "Not reported in accessible text."
     experimental_setup: str
     baselines: str
     metrics: str
@@ -73,6 +75,10 @@ class ComparisonItem(BaseModel):
     methodology: str
     algorithm_model: str
     dataset: str
+    sensor_types: str = "Not reported in accessible text."
+    feature_extraction: str = "Not reported in accessible text."
+    experimental_setup: str = "Not reported in accessible text."
+    baselines: str = "Not reported in accessible text."
     metrics: str
     results: str
     computational_complexity: str
@@ -102,6 +108,7 @@ class ResearchGap(BaseModel):
     proposed_direction: str
     confidence: Literal["low", "medium", "high"]
     confidence_explanation: str
+    evidence_coverage: float = Field(default=0.0, ge=0.0, le=1.0)
 
 
 class CriticIssue(BaseModel):

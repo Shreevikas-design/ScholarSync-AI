@@ -7,6 +7,7 @@ import logging
 import re
 import time
 import threading
+from contextlib import contextmanager
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -20,11 +21,33 @@ import httpx
 from config import Settings
 from services.arxiv_service import parse_arxiv
 from services.crossref_service import parse_crossref
-from services.metadata import norm_doi, title_id
+from services.http_utils import retry_after_seconds, wait_for_host
+from services.metadata import norm_arxiv, norm_doi, title_id
 from services.openalex_service import parse_openalex
 from schemas.models import Paper, ResearchPlan
 
 log = logging.getLogger(__name__)
+_CACHE_LOCK_GUARD = threading.Lock()
+_CACHE_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
+
+
+@contextmanager
+def _cache_key_lock(key: str):
+    with _CACHE_LOCK_GUARD:
+        current = _CACHE_LOCKS.get(key)
+        lock, users = current if current else (threading.Lock(), 0)
+        _CACHE_LOCKS[key] = (lock, users + 1)
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _CACHE_LOCK_GUARD:
+            current_lock, users = _CACHE_LOCKS[key]
+            if users <= 1:
+                _CACHE_LOCKS.pop(key, None)
+            else:
+                _CACHE_LOCKS[key] = (current_lock, users - 1)
 
 
 @dataclass
@@ -44,6 +67,7 @@ class DiscoveryResult:
     api_calls: int = 0
     errors: list[str] = field(default_factory=list)
     cache_hits: int = 0
+    provider_status: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class AcademicSearchService:
@@ -56,8 +80,12 @@ class AcademicSearchService:
         return self.settings.data_dir / "cache" / (hashlib.sha256(key.encode()).hexdigest() + ".json")
 
     def _get(self, url: str, params: dict[str, Any], content: str = "json") -> tuple[Any, int, bool]:
-        self._request_state.error = None
         cache_key = json.dumps([url, params, content], sort_keys=True, ensure_ascii=True)
+        with _cache_key_lock(cache_key):
+            return self._get_locked(url, params, content, cache_key)
+
+    def _get_locked(self, url: str, params: dict[str, Any], content: str, cache_key: str) -> tuple[Any, int, bool]:
+        self._request_state.error = None
         path = self._cache_path(cache_key)
         if self.settings.cache_ttl_hours > 0 and path.exists():
             age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
@@ -72,6 +100,10 @@ class AcademicSearchService:
         final_error = "request failed"
         for attempt in range(attempts):
             try:
+                host = urlparse(url).hostname or ""
+                if host == "api.openalex.org":
+                    # Stay below the shared-IP keyless ceiling even when sessions run concurrently.
+                    wait_for_host(host, min_interval=0.13)
                 calls += 1
                 with httpx.Client(
                     timeout=self.settings.request_timeout,
@@ -79,12 +111,31 @@ class AcademicSearchService:
                     follow_redirects=True,
                 ) as client:
                     response = client.get(url, params=params)
-                if response.status_code in transient_statuses and attempt + 1 < attempts:
-                    try:
-                        delay = float(response.headers.get("Retry-After", 0.5 * (2 ** attempt)))
-                    except (TypeError, ValueError):
-                        delay = 0.5 * (2 ** attempt)
-                    time.sleep(min(max(delay, 0.1), 5.0))
+                status = response.status_code
+                if status in transient_statuses:
+                    reason = ""
+                    retry_header = response.headers.get("Retry-After")
+                    if status == 429:
+                        try:
+                            body = response.json()
+                            reason = str(body.get("reason") or "").casefold()
+                            retry_header = retry_header or str(body.get("retryAfter") or "")
+                        except (ValueError, AttributeError):
+                            pass
+                        if reason == "daily_budget":
+                            final_error = "HTTP 429 (OpenAlex daily API budget exhausted)"
+                            break
+                    if attempt + 1 >= attempts:
+                        final_error = f"HTTP {status} (retry limit reached)"
+                        break
+                    requested_delay = retry_after_seconds(retry_header)
+                    delay = requested_delay if requested_delay is not None else min(0.5 * (2 ** attempt), 8.0)
+                    # Do not retry earlier than the server's requested delay, or sleep for an
+                    # unbounded period. A long Retry-After is surfaced as deferred to the user.
+                    if delay > 8.0:
+                        final_error = f"HTTP {status} (retry deferred; Retry-After exceeds 8 seconds)"
+                        break
+                    time.sleep(max(0.1, delay))
                     continue
                 response.raise_for_status()
                 body = response.json() if content == "json" else response.text
@@ -94,22 +145,30 @@ class AcademicSearchService:
                     except OSError:
                         log.warning("Could not write the local search cache.")
                 return body, calls, False
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError, ValueError) as exc:
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                final_error = f"HTTP {status}" if status is not None else type(exc).__name__
-                retryable = (
-                    isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
-                    or status in transient_statuses
-                )
-                if not retryable or attempt + 1 >= attempts:
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                final_error = type(exc).__name__
+                if attempt + 1 >= attempts:
                     break
                 time.sleep(min(0.25 * (2 ** attempt), 1.0))
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                final_error = f"HTTP {status} (non-retryable client error)"
+                break
+            except ValueError:
+                final_error = "invalid JSON response"
+                break
         self._request_state.error = final_error
         log.warning("Academic API request failed for host=%s: %s", urlparse(url).netloc, final_error)
         return None, calls, False
 
     def _openalex(self, query: str, options: SearchOptions) -> tuple[list[Paper], int, bool, str | None]:
-        params: dict[str, Any] = {"search": query, "per-page": min(max(options.max_papers, 10), 50)}
+        params: dict[str, Any] = {
+            "search": query,
+            "per-page": min(max(options.max_papers, 10), 50),
+            "select": "id,doi,title,publication_year,authorships,abstract_inverted_index,best_oa_location,primary_location,type",
+        }
+        if self.settings.openalex_api_key:
+            params["api_key"] = self.settings.openalex_api_key.get_secret_value()
         if options.start_year and options.end_year:
             params["filter"] = f"from_publication_date:{options.start_year}-01-01,to_publication_date:{options.end_year}-12-31"
         data, calls, hit = self._get("https://api.openalex.org/works", params)
@@ -145,7 +204,15 @@ class AcademicSearchService:
         return papers, calls, hit, None
 
     def search(self, plan: ResearchPlan, options: SearchOptions) -> DiscoveryResult:
-        queries = list(dict.fromkeys(q.strip() for q in plan.search_queries if q.strip()))[:6]
+        queries = []
+        seen_queries = set()
+        for query in plan.search_queries:
+            clean = " ".join(query.split())
+            key = clean.casefold()
+            if clean and key not in seen_queries:
+                seen_queries.add(key)
+                queries.append(clean)
+        queries = queries[:6]
         jobs = []
         for query in queries:
             if options.include_openalex:
@@ -156,7 +223,9 @@ class AcademicSearchService:
                 jobs.append((query, "Crossref", self._crossref))
         raw: list[Paper] = []
         errors: list[str] = []
+        provider_status: dict[str, dict[str, Any]] = {}
         calls = hits = failed = 0
+        completed: dict[tuple[str, str], list[Paper]] = {}
         with ThreadPoolExecutor(max_workers=min(6, max(1, len(jobs)))) as pool:
             futures = {pool.submit(fn, query, options): (query, source) for query, source, fn in jobs}
             for future in as_completed(futures):
@@ -165,13 +234,26 @@ class AcademicSearchService:
                     papers, count, hit, error = future.result()
                     calls += count
                     hits += int(hit)
-                    raw.extend(papers)
+                    completed[(query, source)] = papers
+                    stats = provider_status.setdefault(source, {"calls": 0, "failed_calls": 0, "cache_hits": 0, "records": 0, "errors": []})
+                    stats["calls"] += count
+                    stats["cache_hits"] += int(hit)
+                    stats["records"] += len(papers)
                     if error:
                         failed += 1
                         errors.append(f"{source} ({query[:80]}): {error}")
+                        stats["failed_calls"] += 1
+                        stats["errors"].append(error)
                 except Exception as exc:
                     failed += 1
-                    errors.append(f"{source} ({query[:80]}): {type(exc).__name__}")
+                    message = f"{type(exc).__name__}"
+                    errors.append(f"{source} ({query[:80]}): {message}")
+                    stats = provider_status.setdefault(source, {"calls": 0, "failed_calls": 0, "cache_hits": 0, "records": 0, "errors": []})
+                    stats["failed_calls"] += 1
+                    stats["errors"].append(message)
+        # Preserve query/provider order so canonical IDs and output ordering do not depend on
+        # network completion timing.
+        raw = [paper for query, source, _ in jobs for paper in completed.get((query, source), [])]
         filtered = [
             p for p in raw
             if (options.start_year is None or (p.year is not None and p.year >= options.start_year))
@@ -179,44 +261,83 @@ class AcademicSearchService:
         ]
         unique = deduplicate(filtered)
         ranked = rank_papers(unique, plan.keywords, plan.objective)
+        errors.sort()
+        provider_status = {name: provider_status[name] for name in ("OpenAlex", "arXiv", "Crossref") if name in provider_status}
         return DiscoveryResult(
             papers=ranked[:options.max_papers],
             failed_calls=failed,
             api_calls=calls,
             errors=errors,
             cache_hits=hits,
+            provider_status=provider_status,
         )
 
 
 def deduplicate(papers: list[Paper]) -> list[Paper]:
-    result: list[Paper] = []
-    alias: dict[str, int] = {}
-    for paper in papers:
-        keys = {f"title:{title_id(paper.title)}"}
+    parents = list(range(len(papers)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        a, b = find(left), find(right)
+        if a != b:
+            parents[max(a, b)] = min(a, b)
+
+    owners: dict[str, int] = {}
+    for index, paper in enumerate(papers):
+        normalized_title = title_id(paper.title)
+        keys = [f"title:{normalized_title}"] if normalized_title else []
         doi = norm_doi(paper.doi)
+        arxiv = norm_arxiv(paper.paper_id)
         if doi:
-            keys.add(f"doi:{doi}")
+            keys.insert(0, f"doi:{doi}")
+        if arxiv:
+            keys.insert(0, f"arxiv:{arxiv}")
         for source_id in paper.source_ids:
             if source_id.casefold().startswith("arxiv:"):
-                keys.add("arxiv:" + source_id.split(":", 1)[1].casefold())
-        target = next((alias[key] for key in keys if key in alias), None)
-        if target is None:
-            target = len(result)
-            result.append(paper.model_copy(deep=True))
-        else:
-            old = result[target]
-            result[target] = old.model_copy(update={
-                "authors": old.authors or paper.authors,
-                "abstract": old.abstract or paper.abstract,
-                "year": old.year or paper.year,
-                "doi": old.doi or paper.doi,
-                "url": old.url or paper.url,
-                "pdf_url": old.pdf_url or paper.pdf_url,
-                "source_ids": list(dict.fromkeys(old.source_ids + paper.source_ids + [paper.source])),
-                "is_preprint": old.is_preprint or paper.is_preprint,
-            })
-        for key in keys:
-            alias[key] = target
+                source_arxiv = norm_arxiv(source_id.split(":", 1)[1])
+                if source_arxiv:
+                    keys.append(f"arxiv:{source_arxiv}")
+        for key in dict.fromkeys(keys):
+            if key in owners:
+                union(index, owners[key])
+            else:
+                owners[key] = index
+
+    groups: dict[int, list[Paper]] = {}
+    for index, paper in enumerate(papers):
+        groups.setdefault(find(index), []).append(paper)
+
+    result = []
+    for _, group in sorted(groups.items(), key=lambda item: min(p.paper_id for p in item[1])):
+        first = group[0]
+        dois = sorted({normalized for paper in group if (normalized := norm_doi(paper.doi))})
+        arxiv_ids = {normalized for paper in group if (normalized := norm_arxiv(paper.paper_id))}
+        for paper in group:
+            arxiv_ids.update(
+                normalized for source_id in paper.source_ids
+                if source_id.casefold().startswith("arxiv:")
+                if (normalized := norm_arxiv(source_id.split(":", 1)[1]))
+            )
+        canonical_id = f"doi:{dois[0]}" if dois else (f"arxiv:{sorted(arxiv_ids)[0]}" if arxiv_ids else first.paper_id)
+        abstracts = sorted((paper.abstract for paper in group if paper.abstract), key=len, reverse=True)
+        authors = next((paper.authors for paper in group if paper.authors), [])
+        paper = first.model_copy(update={
+            "paper_id": canonical_id,
+            "authors": authors,
+            "abstract": abstracts[0] if abstracts else "",
+            "year": next((paper.year for paper in group if paper.year), None),
+            "doi": dois[0] if dois else None,
+            "url": (f"https://doi.org/{dois[0]}" if dois else next((paper.url for paper in group if paper.url), None)),
+            "pdf_url": next((paper.pdf_url for paper in group if paper.pdf_url), None),
+            "source_ids": list(dict.fromkeys(value for paper in group for value in (paper.source_ids + [paper.source]))),
+            "is_preprint": any(paper.is_preprint for paper in group),
+        })
+        result.append(paper)
     return result
 
 

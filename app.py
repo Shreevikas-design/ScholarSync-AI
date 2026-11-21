@@ -5,6 +5,8 @@ import logging
 import os
 import sys
 import time
+import hashlib
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,7 +30,11 @@ from evaluation.evaluator import evaluate, evaluate_generation
 from agents.supervisor import ResearchRequest, Supervisor
 from schemas.models import WorkflowEvent
 from services.chat_service import answer_from_papers
+from schemas.models import Paper
 from services.report_service import export_pdf, safe_filename
+from services.pdf_service import extract_pdf_bytes
+from services.retrieval_service import chunk_pages
+from services.llm_service import LLMService
 from services.search_service import AcademicSearchService
 from services.vector_service import VectorService
 
@@ -80,6 +86,15 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "pdf_bytes" not in st.session_state:
     st.session_state.pdf_bytes = None
+st.session_state.setdefault("uploaded_papers", [])
+st.session_state.setdefault("uploaded_chunks", [])
+st.session_state.setdefault("vector_service", None)
+st.session_state.setdefault("vector_signature", None)
+st.session_state.setdefault("vector_unavailable", None)
+st.session_state.setdefault("vector_unavailable_signature", None)
+st.session_state.setdefault("session_key", uuid.uuid4().hex[:16])
+st.session_state.setdefault("chat_llm", None)
+st.session_state.setdefault("chat_llm_signature", None)
 
 pages = [
     "Research Workspace", "Agent Workflow", "Papers", "Comparison",
@@ -90,6 +105,16 @@ page_icons = {
     "Research Gaps": "⌖", "Literature Review": "≡", "Research Chat": "◉",
     "Evaluation": "▥", "Settings": "⚙",
 }
+
+
+def _configured_secret(name: str) -> str:
+    try:
+        value = st.secrets.get(name)
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    return os.getenv(name, "")
 if "active_page" not in st.session_state or st.session_state.active_page not in pages:
     st.session_state.active_page = "Research Workspace"
 
@@ -138,10 +163,11 @@ setting_defaults = {
     "settings_ollama_url": os.getenv("SCHOLARSYNC_OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
     "settings_ollama_model": os.getenv("SCHOLARSYNC_OLLAMA_MODEL", "qwen2.5:7b"),
     "settings_groq_model": os.getenv("SCHOLARSYNC_GROQ_MODEL", "openai/gpt-oss-20b"),
-    "settings_groq_key": os.getenv("SCHOLARSYNC_GROQ_API_KEY", ""),
+    "settings_groq_key": _configured_secret("SCHOLARSYNC_GROQ_API_KEY"),
+    "settings_openalex_key": _configured_secret("SCHOLARSYNC_OPENALEX_API_KEY"),
     "settings_context_tokens": int(os.getenv("SCHOLARSYNC_MAX_CONTEXT_TOKENS", "8192")),
     "settings_output_tokens": int(os.getenv("SCHOLARSYNC_MAX_OUTPUT_TOKENS", "1200")),
-    "settings_embedding_provider": os.getenv("SCHOLARSYNC_EMBEDDING_PROVIDER", "ollama"),
+    "settings_embedding_provider": os.getenv("SCHOLARSYNC_EMBEDDING_PROVIDER", "chroma-default"),
     "settings_embed_model": os.getenv("SCHOLARSYNC_OLLAMA_EMBED_MODEL", "nomic-embed-text"),
     "settings_request_timeout": int(float(os.getenv("SCHOLARSYNC_REQUEST_TIMEOUT", "20"))),
     "settings_max_pdf_mb": int(os.getenv("SCHOLARSYNC_MAX_PDF_MB", "25")),
@@ -154,8 +180,8 @@ for key, value in setting_defaults.items():
     settings_state.setdefault(key, st.session_state.get(key, value))
 if settings_state["settings_provider"] not in ("template", "ollama", "groq"):
     settings_state["settings_provider"] = "template"
-if settings_state["settings_embedding_provider"] not in ("ollama", "sentence-transformers"):
-    settings_state["settings_embedding_provider"] = "ollama"
+if settings_state["settings_embedding_provider"] not in ("chroma-default", "ollama", "sentence-transformers"):
+    settings_state["settings_embedding_provider"] = "chroma-default"
 initial_output_ceiling = max(128, int(settings_state["settings_context_tokens"]) - 128)
 settings_state["settings_output_tokens"] = min(
     max(128, int(settings_state["settings_output_tokens"])), initial_output_ceiling,
@@ -178,6 +204,10 @@ if active_page == "Settings":
             "Groq API key", key="ui_settings_groq_key", type="password",
             help="Kept only in this browser session; it is not written to project files or logs.",
         )
+        st.text_input(
+            "OpenAlex API key", key="ui_settings_openalex_key", type="password",
+            help="Optional. Helps with OpenAlex rate limits. It stays in this browser session and is not logged.",
+        )
     with st.expander("Context and retrieval", expanded=True):
         st.number_input("Context token limit", 1024, 32768, step=1024, key="ui_settings_context_tokens")
         output_ceiling = max(128, int(st.session_state.ui_settings_context_tokens) - 128)
@@ -186,8 +216,8 @@ if active_page == "Settings":
         )
         st.number_input("Maximum output tokens", 128, output_ceiling, step=128, key="ui_settings_output_tokens")
         st.selectbox(
-            "Embedding provider", ["ollama", "sentence-transformers"], key="ui_settings_embedding_provider",
-            help="Sentence Transformers is optional and may download model files when selected.",
+            "Embedding provider", ["chroma-default", "ollama", "sentence-transformers"], key="ui_settings_embedding_provider",
+            help="Chroma's bundled ONNX embedding model is the cloud-safe default. Ollama requires a reachable endpoint; Sentence Transformers is optional and downloads a model.",
         )
         st.text_input("Ollama embedding model", key="ui_settings_embed_model")
     with st.expander("Request and PDF limits"):
@@ -205,6 +235,7 @@ settings = Settings(
     ollama_model=settings_state["settings_ollama_model"],
     groq_model=settings_state["settings_groq_model"],
     groq_api_key=settings_state["settings_groq_key"] or None,
+    openalex_api_key=settings_state["settings_openalex_key"] or None,
     max_context_tokens=int(settings_state["settings_context_tokens"]),
     max_output_tokens=int(settings_state["settings_output_tokens"]),
     embedding_provider=settings_state["settings_embedding_provider"],
@@ -218,6 +249,48 @@ settings = Settings(
 settings.ensure_data_dirs()
 
 result = st.session_state.research
+
+
+def _embedding_signature() -> tuple[str, str, str]:
+    return (settings.embedding_provider, settings.ollama_base_url, settings.ollama_embed_model)
+
+
+def _llm_for_session() -> LLMService:
+    secret = settings.groq_api_key.get_secret_value() if settings.groq_api_key else ""
+    signature = (settings.provider, settings.ollama_base_url, settings.ollama_model, settings.groq_model,
+                 hashlib.sha256(secret.encode()).hexdigest() if secret else "", settings.max_context_tokens, settings.max_output_tokens)
+    if st.session_state.chat_llm is None or st.session_state.chat_llm_signature != signature:
+        st.session_state.chat_llm = LLMService(settings)
+        st.session_state.chat_llm_signature = signature
+    return st.session_state.chat_llm
+
+
+def _vector_for_current_corpus(papers: list[Paper], chunks: list[dict], rebuild: bool = False):
+    service = st.session_state.vector_service
+    signature = _embedding_signature()
+    unavailable = st.session_state.get("vector_unavailable")
+    if not rebuild and unavailable and st.session_state.vector_unavailable_signature == signature:
+        return None, unavailable
+    if rebuild or service is None or st.session_state.vector_signature != signature:
+        candidate = None
+        try:
+            candidate = VectorService(settings, collection_name=f"ss_{st.session_state.session_key}_{uuid.uuid4().hex[:12]}")
+            candidate.add(chunks)
+        except Exception as exc:
+            message = f"Semantic indexing failed ({type(exc).__name__}); keyword retrieval remains available."
+            st.session_state.vector_unavailable = message
+            st.session_state.vector_unavailable_signature = signature
+            if candidate:
+                candidate.cleanup()
+            return None, message
+        if service:
+            service.cleanup()
+        service = candidate
+        st.session_state.vector_service = service
+        st.session_state.vector_signature = signature
+        st.session_state.vector_unavailable = None
+        st.session_state.vector_unavailable_signature = None
+    return service, None
 
 if active_page == "Research Workspace":
     st.subheader("Define a research run")
@@ -252,7 +325,6 @@ if active_page == "Research Workspace":
         elif not any((include_openalex, include_arxiv, include_crossref)):
             st.error("Enable at least one academic search source.")
         else:
-            st.session_state.pdf_bytes = None
             observed: list[WorkflowEvent] = []
 
             def update_progress(item: WorkflowEvent):
@@ -265,10 +337,7 @@ if active_page == "Research Workspace":
                     rows.append(f"{ev.status:<10} | {name:<28} | {ev.summary or ev.error or ''}")
                 progress_area.code("\n".join(rows), language="text")
 
-            names = ["Research Planner", "Paper Discovery", "Paper Analysis", "Comparative Analysis", "Research Gap Analysis", "Literature Review Writer", "Evidence Critic", "Citation Validation"]
-            stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            for name in names:
-                update_progress(WorkflowEvent(agent=name, status="Pending", started_at=stamp))
+            progress_area.info("Waiting for the first LangGraph stage event…")
             with st.status("Running the LangGraph research workflow", expanded=True) as status:
                 try:
                     started_run = time.perf_counter()
@@ -277,17 +346,42 @@ if active_page == "Research Workspace":
                         max_papers=int(max_papers), include_openalex=include_openalex,
                         include_arxiv=include_arxiv, include_crossref=include_crossref,
                     )
-                    result = Supervisor(settings).run(request, on_event=update_progress)
+                    run_vectors = VectorService(
+                        settings,
+                        collection_name=f"ss_{st.session_state.session_key}_{uuid.uuid4().hex[:12]}",
+                    )
+                    previous_vectors = st.session_state.vector_service
+                    preindex_errors = []
+                    try:
+                        run_vectors.add(st.session_state.uploaded_chunks)
+                    except Exception as exc:
+                        preindex_errors.append(f"Uploaded-paper indexing unavailable: {type(exc).__name__}")
+                    result = Supervisor(settings, vector_service=run_vectors).run(
+                        request, on_event=update_progress, reuse_result=st.session_state.research,
+                    )
                     result["latency_seconds"] = time.perf_counter() - started_run
                     result["ui_events"] = observed
+                    result["run_id"] = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + hashlib.sha256(clean_topic.encode()).hexdigest()[:8]
+                    if preindex_errors:
+                        result.setdefault("rag_errors", []).extend(preindex_errors)
                     st.session_state.research = result
+                    st.session_state.chat_history = []
+                    st.session_state.chat_papers = []
+                    st.session_state.vector_service = run_vectors
+                    st.session_state.vector_signature = _embedding_signature()
+                    st.session_state.vector_unavailable = None
+                    st.session_state.vector_unavailable_signature = None
+                    if previous_vectors:
+                        previous_vectors.cleanup()
                     status.update(label="Research workflow finished", state="complete")
                     st.success(
-                        f"Collected {len(result.get('papers', []))} papers; "
+                        f"Run {result['run_id']} | collected {len(result.get('papers', []))} papers; "
                         f"{len(result.get('analyses', []))} analyses; "
                         f"{len(result.get('gaps', []))} evidence-supported limitations/gaps."
                     )
                 except Exception as exc:
+                    if "run_vectors" in locals():
+                        run_vectors.cleanup()
                     log.exception("Research workflow failed")
                     status.update(label="Research workflow failed", state="error")
                     st.error(f"{type(exc).__name__}: {exc}")
@@ -297,6 +391,8 @@ result = st.session_state.research
 if active_page == "Agent Workflow":
     st.subheader("Observed agent workflow")
     if result:
+        if result.get("run_id"):
+            st.caption(f"Research run ID: {result['run_id']}")
         events = result.get("ui_events", result.get("events", []))
         if events:
             st.dataframe(
@@ -320,6 +416,9 @@ if active_page == "Agent Workflow":
         if result.get("search_errors"):
             with st.expander("Search/API errors"):
                 st.write("\n".join(result["search_errors"]))
+        if result.get("provider_status"):
+            with st.expander("Search provider status"):
+                st.json(result["provider_status"])
         if result.get("rag_errors"):
             with st.expander("Embedding/indexing errors"):
                 st.write("\n".join(result["rag_errors"]))
@@ -340,9 +439,54 @@ if active_page == "Agent Workflow":
 
 if active_page == "Papers":
     st.subheader("Collected papers")
+    st.caption("Upload a PDF to add page-aware evidence to Research Chat. Bibliographic details are taken from the PDF metadata or fields you provide.")
+    upload = st.file_uploader("Upload an accessible PDF", type=["pdf"], key="paper_upload")
+    if upload:
+        default_title = Path(upload.name).stem
+        upload_title = st.text_input("Paper title", value=default_title, key="upload_title")
+        upload_authors = st.text_input("Authors (optional; comma separated)", key="upload_authors")
+        upload_year = st.number_input("Publication year (optional; use 0 if unknown)", min_value=0, max_value=2100, value=0, key="upload_year")
+        upload_doi = st.text_input("DOI (optional)", key="upload_doi")
+        if st.button("Index uploaded PDF", key="upload_index", type="primary"):
+            contents = upload.getvalue()
+            digest = hashlib.sha256(contents).hexdigest()
+            paper_id = f"upload:{digest}"
+            if any(p.paper_id == paper_id for p in st.session_state.uploaded_papers):
+                st.info("This PDF is already in the current session library.")
+            else:
+                pdf = extract_pdf_bytes(contents, settings)
+                if not pdf.ok:
+                    st.error(pdf.error or "PDF extraction failed.")
+                else:
+                    title = " ".join(upload_title.split()) or pdf.metadata.get("title") or default_title
+                    paper = Paper(
+                        paper_id=paper_id, title=title,
+                        authors=[name.strip() for name in upload_authors.split(",") if name.strip()],
+                        abstract="", year=int(upload_year) or None, doi=upload_doi.strip() or None,
+                        url=None, pdf_url=None, source="User upload", source_ids=[paper_id],
+                        full_text_status="partial-full-text" if pdf.truncated else "full-text",
+                    )
+                    pages = [{"page": p.page, "text": p.text, "location": "full-text"} for p in pdf.pages]
+                    chunks = chunk_pages(paper, pages)
+                    try:
+                        existing_chunks = (result or {}).get("chunks", []) + st.session_state.uploaded_chunks
+                        existing_papers = (result or {}).get("papers", []) + st.session_state.uploaded_papers
+                        vector, vector_error = _vector_for_current_corpus(existing_papers + [paper], existing_chunks + chunks)
+                        if vector:
+                            vector.add(chunks)
+                        elif vector_error:
+                            st.info(vector_error)
+                    except Exception as exc:
+                        st.info(f"Semantic indexing failed ({type(exc).__name__}); keyword retrieval remains available.")
+                    st.session_state.uploaded_papers.append(paper)
+                    st.session_state.uploaded_chunks.extend(chunks)
+                    if pdf.error:
+                        st.warning(pdf.error)
+                    st.success(f"Indexed {len(pdf.pages)} readable pages into {len(chunks)} evidence chunks for this session.")
     if result:
         papers = result.get("papers", [])
-        st.metric("Papers", len(papers))
+        uploaded_papers = st.session_state.uploaded_papers
+        st.metric("Papers", len(papers) + len(uploaded_papers))
         for index, paper in enumerate(papers, start=1):
             with st.expander(f"{index}. {paper.title} ({paper.year or 'year not supplied'}) | relevance {paper.relevance_score:.3f}"):
                 st.write("Authors:", ", ".join(paper.authors) or "Not supplied")
@@ -357,6 +501,8 @@ if active_page == "Papers":
                 analysis = next((a for a in result.get("analyses", []) if a.paper_id == paper.paper_id), None)
                 if analysis:
                     st.write("Analysis mode:", analysis.analysis_mode)
+                    st.write("Sensors:", analysis.sensor_types)
+                    st.write("Feature extraction:", analysis.feature_extraction)
                     st.json(analysis.model_dump(exclude={"evidence"}))
                     if analysis.evidence:
                         st.write("Evidence excerpts")
@@ -365,8 +511,27 @@ if active_page == "Papers":
                             st.markdown(f"> {item.quote}\n\n— {loc}")
                     if analysis.error:
                         st.warning(analysis.error)
+        if uploaded_papers:
+            st.markdown("#### User-uploaded papers")
+            for paper in uploaded_papers:
+                with st.expander(paper.title + " · uploaded " + paper.full_text_status):
+                    st.write("Authors:", ", ".join(paper.authors) or "Not supplied")
+                    st.write("Year:", paper.year or "Not supplied", "· DOI:", paper.doi or "Not supplied")
+                    st.caption("User-uploaded metadata; indexed for this Streamlit session only.")
     else:
-        st.info("Run a search to populate this tab.")
+        if st.session_state.uploaded_papers:
+            st.info("No search has run yet. Uploaded papers are available in Research Chat for this session.")
+            for paper in st.session_state.uploaded_papers:
+                st.write(f"• {paper.title} — full-text uploaded")
+        else:
+            st.info("Run a search or upload an accessible PDF to populate this tab.")
+    export_papers = ((result or {}).get("papers", []) + st.session_state.uploaded_papers)
+    if export_papers:
+        st.download_button(
+            "Export paper metadata (JSON)",
+            data=json.dumps([paper.model_dump() for paper in export_papers], ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name="scholarsync-paper-metadata.json", mime="application/json",
+        )
 
 if active_page == "Comparison":
     st.subheader("Method and result comparison")
@@ -386,6 +551,10 @@ if active_page == "Comparison":
                     "Algorithm/model": item.algorithm_model,
                     "Complexity": item.computational_complexity,
                     "Dataset": item.dataset,
+                    "Sensors": item.sensor_types,
+                    "Feature extraction": item.feature_extraction,
+                    "Experimental setup": item.experimental_setup,
+                    "Baselines": item.baselines,
                     "Metrics": item.metrics,
                     "Results": item.results,
                     "Strengths": item.strengths,
@@ -411,6 +580,7 @@ if active_page == "Research Gaps":
                 st.write("Why it matters:", gap.why_it_matters)
                 st.write("Proposed direction:", gap.proposed_direction)
                 st.write("Confidence explanation:", gap.confidence_explanation)
+                st.write("Evidence coverage:", f"{gap.evidence_coverage:.0%} of analyzed papers")
                 st.write("Related paper IDs:", ", ".join(gap.related_paper_ids))
                 for evidence in gap.supporting_evidence:
                     paper = next((p for p in result.get("papers", []) if p.paper_id == evidence.paper_id), None)
@@ -419,6 +589,12 @@ if active_page == "Research Gaps":
                     st.markdown(f"> {evidence.quote}\n\n— {label}, {location}")
     else:
         st.info("Run a search first.")
+    if result and result.get("gaps"):
+        st.download_button(
+            "Export research gaps (JSON)",
+            data=json.dumps([gap.model_dump() for gap in result["gaps"]], ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name="scholarsync-research-gaps.json", mime="application/json",
+        )
 
 if active_page == "Literature Review":
     st.subheader("Literature review")
@@ -458,33 +634,36 @@ if active_page == "Literature Review":
 
 if active_page == "Research Chat":
     st.subheader("Ask the collected papers")
-    if result and result.get("papers"):
-        papers = result["papers"]
+    papers = ((result or {}).get("papers", []) + st.session_state.uploaded_papers)
+    chunks = ((result or {}).get("chunks", []) + st.session_state.uploaded_chunks)
+    if papers:
         labels = {p.paper_id: f"{p.title} ({p.year or 'n.d.'})" for p in papers}
+        if "chat_papers" in st.session_state:
+            st.session_state.chat_papers = [pid for pid in st.session_state.chat_papers if pid in labels]
         selected_ids = st.multiselect("Limit search to selected papers", list(labels), format_func=lambda item: labels[item], key="chat_papers")
         question = st.text_input("Question", placeholder="Which datasets and limitations are reported?")
         if st.button("Retrieve evidence", key="chat_submit"):
             if len(question.strip()) < 4:
                 st.warning("Enter a question.")
             else:
-                vector = None
-                try:
-                    vector = VectorService(settings)
-                except Exception as exc:
-                    st.info(f"Semantic index unavailable ({type(exc).__name__}); keyword evidence retrieval remains active.")
+                vector, vector_error = _vector_for_current_corpus(papers, chunks)
                 response = answer_from_papers(
-                    question, papers, result.get("chunks", []), vector_service=vector,
-                    selected_paper_ids=selected_ids or None,
+                    question, papers, chunks, vector_service=vector,
+                    selected_paper_ids=selected_ids,
+                    llm_service=_llm_for_session(),
                 )
+                if vector_error:
+                    response["warning"] = vector_error
                 if response.get("warning"):
                     st.info(response["warning"])
                 st.session_state.chat_history.append({"question": question, **response})
         for entry in reversed(st.session_state.chat_history):
             st.markdown(f"**Question:** {entry['question']}")
+            st.caption(f"Retrieval: {entry.get('retrieval_mode', 'unknown')} · Answer: {entry.get('answer_mode', 'unknown')}")
             st.markdown(entry["answer"])
             st.divider()
     else:
-        st.info("Run a research search and collect paper abstracts or text before chatting.")
+        st.info("Run a research search or upload an accessible PDF before chatting.")
 
 if active_page == "Evaluation":
     st.subheader("Retrieval evaluation")
@@ -495,7 +674,22 @@ if active_page == "Evaluation":
             try:
                 searcher = AcademicSearchService(settings)
                 measured = evaluate(ROOT / "evaluation" / "dataset.json", searcher, k=k)
-                st.json(measured)
+                st.metric("Scorable queries", measured["scorable_cases"])
+                left, middle, right = st.columns(3)
+                left.metric("Mean Precision@K", "Unavailable" if measured["mean_precision_at_k"] is None else f"{measured['mean_precision_at_k']:.3f}")
+                middle.metric("Mean Recall@K", "Unavailable" if measured["mean_recall_at_k"] is None else f"{measured['mean_recall_at_k']:.3f}")
+                right.metric("Mean Reciprocal Rank", "Unavailable" if measured["mean_mrr"] is None else f"{measured['mean_mrr']:.3f}")
+                st.dataframe([
+                    {key: row[key] for key in (
+                        "query", "status", "retrieved_ids", "relevant_ids", "matched_ids",
+                        "precision_at_k", "recall_at_k", "reciprocal_rank", "explanation",
+                    )}
+                    for row in measured["cases"]
+                ], use_container_width=True, hide_index=True)
+                with st.expander("Provider-level evaluation details"):
+                    for row in measured["cases"]:
+                        st.markdown(f"**{row['query']}** · {row['status']}")
+                        st.json({"retrieved_titles": row["retrieved_titles"], "provider_status": row["provider_status"], "API calls": row["api_calls"], "failed API calls": row["failed_api_calls"]})
             except Exception as exc:
                 st.error(f"Evaluation failed: {type(exc).__name__}: {exc}")
     if result:
@@ -504,5 +698,5 @@ if active_page == "Evaluation":
             st.json(evaluate_generation(result["report"], result.get("papers", []), result.get("analyses", [])))
         st.caption(
             f"This workflow run used {result.get('api_calls', 0)} academic API calls and "
-            f"{result.get('failed_api_calls', 0)} failed calls. End-to-end latency is not currently recorded per agent."
+            f"{result.get('failed_api_calls', 0)} failed calls. Per-agent start and completion timestamps appear in Agent Workflow."
         )

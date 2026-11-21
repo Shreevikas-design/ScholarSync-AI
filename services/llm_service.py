@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import TypeVar
@@ -11,6 +12,7 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from config import Settings
+from services.http_utils import retry_after_seconds
 
 log = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
@@ -46,6 +48,8 @@ class LLMService:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.usage = Usage()
+        self._lock = threading.RLock()
+        self._provider_unavailable: str | None = None
 
     @staticmethod
     def estimate_tokens(text: str) -> int:
@@ -53,11 +57,15 @@ class LLMService:
         return max(1, (len(text) + 2) // 3)
 
     def _request(self, prompt: str, max_tokens: int) -> tuple[str, dict[str, int]]:
+        if self._provider_unavailable:
+            raise ProviderError(self._provider_unavailable)
         estimated = self.estimate_tokens(prompt)
-        self.usage.estimated_prompt_tokens += estimated
+        with self._lock:
+            self.usage.estimated_prompt_tokens += estimated
         if estimated + max_tokens > self.settings.max_context_tokens:
-            self.usage.budget_rejections += 1
-            self.usage.errors.append("local token budget rejection")
+            with self._lock:
+                self.usage.budget_rejections += 1
+                self.usage.errors.append("local token budget rejection")
             raise TokenBudgetError(
                 f"Prompt budget exceeded before request: about {estimated} input tokens + "
                 f"{max_tokens} output tokens > {self.settings.max_context_tokens} context tokens. "
@@ -68,7 +76,8 @@ class LLMService:
         if self.settings.provider == "groq":
             key = self.settings.groq_api_key.get_secret_value() if self.settings.groq_api_key else ""
             if not key:
-                self.usage.errors.append("Groq selected without an API key")
+                with self._lock:
+                    self.usage.errors.append("Groq selected without an API key")
                 raise ProviderError("Groq selected but SCHOLARSYNC_GROQ_API_KEY is not configured.")
             url = "https://api.groq.com/openai/v1/chat/completions"
             headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
@@ -96,14 +105,15 @@ class LLMService:
         else:
             raise ProviderError(f"Unsupported provider: {self.settings.provider}")
 
-        attempts = self.settings.max_retries + 1
+        attempts = min(2, self.settings.max_retries + 1)
         transient = {429, 500, 502, 503, 504}
         started = time.perf_counter()
         last_error = "provider request failed"
         for attempt in range(attempts):
             try:
-                self.usage.llm_calls += 1
-                self.usage.estimated_prompt_tokens += estimated if attempt else 0
+                with self._lock:
+                    self.usage.llm_calls += 1
+                    self.usage.estimated_prompt_tokens += estimated if attempt else 0
                 with httpx.Client(timeout=self.settings.request_timeout) as client:
                     response = client.post(url, headers=headers, json=payload)
                 if response.status_code >= 400:
@@ -114,10 +124,19 @@ class LLMService:
                             f"{self.settings.provider} rejected the token budget (HTTP {response.status_code}). "
                             "The request was not retried; reduce context or output tokens."
                         )
-                    last_error = f"{self.settings.provider} returned HTTP {response.status_code}: {body}"
+                    safe_body = body
+                    if self.settings.groq_api_key:
+                        safe_body = safe_body.replace(self.settings.groq_api_key.get_secret_value(), "[REDACTED]")
+                    last_error = f"{self.settings.provider} returned HTTP {response.status_code}: {safe_body}"
                     if response.status_code not in transient or attempt + 1 >= attempts:
+                        if self.settings.provider == "ollama" and response.status_code not in transient:
+                            self._provider_unavailable = "Ollama is unavailable or rejected the request; no further Ollama calls will be attempted in this workflow. Select a configured provider or template mode."
                         raise ProviderError(last_error)
-                    time.sleep(min(0.5 * (2 ** attempt), 2.0))
+                    retry_after = retry_after_seconds(response.headers.get("Retry-After"))
+                    delay = retry_after if retry_after is not None else min(0.5 * (2 ** attempt), 2.0)
+                    if delay > 8:
+                        raise ProviderError(f"{self.settings.provider} requested a retry delay over 8 seconds; retry deferred.")
+                    time.sleep(max(0.1, delay))
                     continue
                 data = response.json()
                 if self.settings.provider == "ollama":
@@ -130,32 +149,38 @@ class LLMService:
                     usage = data.get("usage") or {}
                     prompt_count = int(usage.get("prompt_tokens") or 0)
                     output_count = int(usage.get("completion_tokens") or 0)
-                self.usage.prompt_tokens += prompt_count
-                self.usage.completion_tokens += output_count
-                self.usage.latency_seconds += time.perf_counter() - started
+                with self._lock:
+                    self.usage.prompt_tokens += prompt_count
+                    self.usage.completion_tokens += output_count
+                    self.usage.latency_seconds += time.perf_counter() - started
                 if not text:
                     raise ProviderError(f"{self.settings.provider} returned an empty response.")
                 return text, {"prompt_tokens": prompt_count, "completion_tokens": output_count}
             except TokenBudgetError:
-                self.usage.failed_calls += 1
-                self.usage.errors.append("provider token/context limit")
-                self.usage.latency_seconds += time.perf_counter() - started
+                with self._lock:
+                    self.usage.failed_calls += 1
+                    self.usage.errors.append("provider token/context limit")
+                    self.usage.latency_seconds += time.perf_counter() - started
                 raise
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 last_error = f"{self.settings.provider} network/timeout error: {type(exc).__name__}"
                 if attempt + 1 >= attempts:
+                    if self.settings.provider == "ollama":
+                        self._provider_unavailable = "Ollama is unreachable; no further Ollama calls will be attempted in this workflow. Select a configured provider or template mode."
                     break
                 time.sleep(min(0.5 * (2 ** attempt), 2.0))
             except ProviderError:
-                self.usage.failed_calls += 1
-                self.usage.errors.append(last_error[:300])
+                with self._lock:
+                    self.usage.failed_calls += 1
+                    self.usage.errors.append(last_error[:300])
                 raise
             except (ValueError, KeyError, TypeError) as exc:
                 last_error = f"invalid response from {self.settings.provider}: {type(exc).__name__}"
                 break
-        self.usage.failed_calls += 1
-        self.usage.errors.append(last_error[:300])
-        self.usage.latency_seconds += time.perf_counter() - started
+        with self._lock:
+            self.usage.failed_calls += 1
+            self.usage.errors.append(last_error[:300])
+            self.usage.latency_seconds += time.perf_counter() - started
         log.warning("LLM request failed for provider=%s: %s", self.settings.provider, last_error)
         raise ProviderError(last_error)
 
@@ -174,7 +199,9 @@ class LLMService:
             payload = json.loads(cleaned)
             return schema.model_validate(payload)
         except (json.JSONDecodeError, ValidationError) as exc:
-            self.usage.errors.append("invalid structured output")
+            with self._lock:
+                self.usage.failed_calls += 1
+                self.usage.errors.append("invalid structured output")
             raise ProviderError(f"Structured response failed {schema.__name__} validation: {exc}") from exc
 
     def complete_text(self, prompt: str, max_tokens: int | None = None) -> str:

@@ -45,7 +45,12 @@ def _parse_body(body: str, styles) -> list:
         head_style = ParagraphStyle(name="TableHead", parent=cell_style, fontName="Helvetica-Bold", textColor=colors.HexColor("#16324F"))
         rows = [[Paragraph(_escape(cell), head_style if row_i == 0 else cell_style) for cell in row] for row_i, row in enumerate(raw_rows)]
         if rows:
-            table = Table(rows, colWidths=[1.2 * inch, 1.1 * inch, 1.1 * inch, 0.75 * inch, 0.8 * inch, 0.75 * inch, 1.0 * inch, 0.8 * inch, 0.8 * inch, 1.3 * inch], repeatRows=1, hAlign="LEFT")
+            weights = [1.7, 1.25, 1.0, 0.8, 1.0, 0.7, 0.9, 1.0, 0.8, 0.8, 0.8, 1.0, 1.0, 1.2]
+            columns = max(len(row) for row in raw_rows)
+            weights = (weights + [0.9] * columns)[:columns]
+            available_width = landscape(letter)[0] - 1.4 * inch
+            scale = available_width / sum(weights)
+            table = Table(rows, colWidths=[weight * scale for weight in weights], repeatRows=1, hAlign="LEFT")
             table.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DCE6F1")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#16324F")),

@@ -46,6 +46,23 @@ def test_analysis_is_abstract_only_and_evidence_is_exact(settings_factory, real_
     assert all(item.page is None and item.location == "abstract" for item in analysis.evidence)
 
 
+def test_metadata_only_analysis_does_not_claim_an_abstract(settings_factory, real_paper):
+    paper = real_paper.model_copy(update={"abstract": "", "pdf_url": None})
+    settings = settings_factory()
+    analysis = PaperAnalyzer(settings, LLMService(settings)).run(paper)
+    assert analysis.analysis_mode == "metadata-only"
+    assert analysis.objective == "Not reported in accessible text."
+    assert not analysis.evidence
+
+
+def test_page_limited_analysis_is_marked_partial_full_text(settings_factory, real_paper):
+    settings = settings_factory()
+    analysis = PaperAnalyzer(settings, LLMService(settings)).run(
+        real_paper, [{"page": 1, "text": real_paper.abstract}], partial_full_text=True,
+    )
+    assert analysis.analysis_mode == "partial-full-text"
+
+
 def test_analyzer_rejects_an_invented_page_number(settings_factory, real_paper):
     settings = settings_factory(provider="groq")
     template_settings = settings_factory()
@@ -67,7 +84,7 @@ def test_comparison_warns_when_numeric_conditions_are_missing(settings_factory, 
     analysis = PaperAnalyzer(settings, LLMService(settings)).run(real_paper)
     result = ComparativeAnalyst().run([real_paper], [analysis])
     assert len(result.items) == 1
-    assert "not directly comparable" in result.items[0].comparability_note
+    assert "Only one analyzed paper" in result.items[0].comparability_note
     assert result.items[0].strengths
 
 
@@ -81,6 +98,22 @@ def test_author_reported_limitation_requires_quote(settings_factory, real_paper)
     assert gaps
     assert gaps[0].category == "author-reported limitation"
     assert gaps[0].supporting_evidence[0].quote in paper.abstract
+    assert gaps[0].confidence == "low"
+    assert gaps[0].evidence_coverage == 1.0
+
+
+def test_repeated_limitation_confidence_requires_independent_papers(settings_factory, real_paper):
+    settings = settings_factory()
+    base = PaperAnalyzer(settings, LLMService(settings)).run(real_paper)
+    limitation = "The method assumes fixed and static user traffic throughout evaluation."
+    analyses = [base.model_copy(update={
+        "paper_id": f"arxiv:test{i}",
+        "limitations": limitation,
+        "evidence": [EvidenceSpan(paper_id=f"arxiv:test{i}", field="limitations", quote=limitation, location="abstract")],
+    }) for i in range(3)]
+    repeated = next(g for g in ResearchGapAnalyzer().run(analyses) if g.category == "cross-paper observation")
+    assert repeated.confidence == "high"
+    assert repeated.evidence_coverage == 1.0
 
 
 def test_system_generated_hypothesis_is_low_confidence_and_cited(settings_factory, real_paper):
@@ -127,6 +160,34 @@ def test_critic_accepts_grounded_report(settings_factory, real_paper):
     )
     assert result.accepted
     assert not [i for i in result.issues if i.severity == "error"]
+
+
+def test_writer_validates_synthesis_evidence_and_reuses_it(settings_factory, real_paper):
+    from agents.writer import LiteratureReviewWriter, SynthesisClaim, SynthesisDraft, ThemeSynthesis, EvidenceReference
+    settings = settings_factory(provider="groq")
+    analysis = PaperAnalyzer(settings_factory(), LLMService(settings_factory())).run(real_paper)
+
+    class FakeLLM:
+        def __init__(self):
+            self.settings = settings
+            self.calls = 0
+        def generate_json(self, prompt, schema, max_tokens=None):
+            self.calls += 1
+            evidence = analysis.evidence[0]
+            return SynthesisDraft(themes=[ThemeSynthesis(theme="Optimization", claims=[SynthesisClaim(
+                text="The included study frames access point planning as an optimization task.",
+                evidence=[EvidenceReference(paper_id=real_paper.paper_id, quote=evidence.quote)],
+            )])])
+
+    llm = FakeLLM()
+    writer = LiteratureReviewWriter(llm)
+    plan = heuristic_plan("Wi-Fi access point placement", 2011, 2026)
+    comparison = ComparativeAnalyst().run([real_paper], [analysis])
+    report = writer.run("Wi-Fi access point placement", plan, [real_paper], [analysis], comparison, [], 2011, 2026)
+    writer.run("Wi-Fi access point placement", plan, [real_paper], [analysis], comparison, [], 2011, 2026)
+    assert "The included study frames access point planning" in report.markdown
+    assert "[1]" in report.markdown
+    assert llm.calls == 1
 
 
 def test_critic_rejects_quote_absent_from_source(settings_factory, real_paper):
@@ -181,6 +242,30 @@ def test_graph_runs_all_agents_and_emits_statuses(monkeypatch, settings_factory,
     assert any(event.status == "Completed" for event in events)
     assert state["citation_errors"] == []
     assert state["revision_count"] == 0
+
+
+def test_graph_reuses_analysis_when_paper_fingerprint_matches(monkeypatch, settings_factory, real_paper):
+    import graph.workflow as workflow
+    class FakeVector:
+        def __init__(self, *args, **kwargs): pass
+        def add(self, chunks): return len(chunks)
+    monkeypatch.setattr(workflow, "VectorService", FakeVector)
+    paper = real_paper.model_copy(update={"pdf_url": "https://example.org/paper.pdf", "full_text_status": "abstract-only"})
+    settings = settings_factory()
+    analysis = PaperAnalyzer(settings, LLMService(settings)).run(paper)
+    previous = {
+        "papers": [paper], "analyses": [analysis],
+        "source_texts": {paper.paper_id: [{"page": None, "location": "abstract", "text": paper.abstract}]},
+    }
+    monkeypatch.setattr(workflow, "download_pdf", lambda *args: (_ for _ in ()).throw(AssertionError("cached paper should not download again")))
+    state = build_workflow(settings, search_service=FakeSearch([paper]), reuse_result=previous).invoke({
+        "topic": "Wi-Fi access point location optimization", "start_year": 2010, "end_year": 2026,
+        "max_papers": 10, "include_openalex": True, "include_arxiv": True,
+        "include_crossref": True, "revision_count": 0, "events": [], "fatal_errors": [],
+    }, config={"recursion_limit": 30})
+    analysis_event = next(event for event in state["events"] if event.agent == "Paper Analysis" and event.status == "Completed")
+    assert "1 reusable analyses reused" in analysis_event.summary
+    assert state["analyses"][0] == analysis
 
 
 def test_critic_revision_loop_is_capped_at_two(monkeypatch, settings_factory, real_paper):

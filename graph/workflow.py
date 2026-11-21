@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Callable
@@ -12,6 +14,7 @@ from agents.critic import EvidenceCritic
 from agents.gap_analyzer import ResearchGapAnalyzer
 from agents.paper_analyzer import PaperAnalyzer
 from agents.planner import ResearchPlanner
+from agents.planner import heuristic_plan
 from agents.writer import LiteratureReviewWriter
 from config import Settings
 from graph.state import ResearchState
@@ -29,18 +32,41 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _analysis_fingerprint(paper, settings: Settings) -> str:
+    payload = {
+        "paper_id": paper.paper_id, "title": paper.title, "abstract": paper.abstract, "pdf_url": paper.pdf_url,
+        "provider": settings.provider, "ollama_model": settings.ollama_model, "groq_model": settings.groq_model,
+        "max_context_tokens": settings.max_context_tokens, "max_output_tokens": settings.max_output_tokens,
+        "max_pdf_pages": settings.max_pdf_pages,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def build_workflow(
     settings: Settings,
     on_event: Callable[[WorkflowEvent], None] | None = None,
     search_service: AcademicSearchService | None = None,
+    vector_service: VectorService | None = None,
+    reuse_result: dict | None = None,
 ) :
     llm = LLMService(settings)
     searcher = search_service or AcademicSearchService(settings)
+    vectors = vector_service or VectorService(settings)
+    reuse_cache = {}
+    reused_analysis_ids: set[str] = set()
+    if reuse_result:
+        old_papers = {paper.paper_id: paper for paper in reuse_result.get("papers", [])}
+        old_analyses = {analysis.paper_id: analysis for analysis in reuse_result.get("analyses", [])}
+        old_sources = reuse_result.get("source_texts", {})
+        for paper_id, analysis in old_analyses.items():
+            paper = old_papers.get(paper_id)
+            if paper:
+                reuse_cache[paper_id] = (_analysis_fingerprint(paper, settings), paper.full_text_status, analysis, old_sources.get(paper_id, []))
     planner = ResearchPlanner(settings, llm)
     analyzer = PaperAnalyzer(settings, llm)
     comparator = ComparativeAnalyst()
     gap_agent = ResearchGapAnalyzer()
-    writer = LiteratureReviewWriter()
+    writer = LiteratureReviewWriter(llm=llm)
     critic = EvidenceCritic()
 
     def event(agent: str, status: str, started: str, summary: str = "", error: str | None = None) -> WorkflowEvent:
@@ -61,7 +87,10 @@ def build_workflow(
             return {"plan": plan, "events": [running, event(planner.name, "Completed", started, f"{len(plan.search_queries)} queries planned.", planner.last_error)]}
         except Exception as exc:
             log.exception("Planner failed")
-            return {"plan": None, "fatal_errors": [f"Planner failed: {type(exc).__name__}"], "events": [running, event(planner.name, "Failed", started, error=str(exc))]}
+            # Keep the run usable with the validated deterministic planner when an optional
+            # provider is unavailable or returns malformed structured output.
+            plan = heuristic_plan(state["topic"], state.get("start_year"), state.get("end_year"))
+            return {"plan": plan, "fatal_errors": [f"Planner fallback used: {type(exc).__name__}"], "events": [running, event(planner.name, "Failed", started, f"Deterministic fallback created {len(plan.search_queries)} queries.", str(exc))]}
 
     def discovery_node(state: ResearchState) -> dict:
         started = _now()
@@ -83,7 +112,7 @@ def build_workflow(
             summary = f"{len(result.papers)} unique papers; {result.api_calls} API calls; {result.failed_calls} failures; {result.cache_hits} cache hits."
             return {
                 "papers": result.papers, "api_calls": result.api_calls, "failed_api_calls": result.failed_calls,
-                "search_errors": result.errors,
+                "search_errors": result.errors, "provider_status": result.provider_status,
                 "events": [running, event("Paper Discovery", "Completed", started, summary, "; ".join(result.errors[:3]) or None)],
             }
         except Exception as exc:
@@ -92,17 +121,26 @@ def build_workflow(
                     "events": [running, event("Paper Discovery", "Failed", started, error=f"{type(exc).__name__}: {exc}")]}
 
     def analyze_one(paper):
+        cached = reuse_cache.get(paper.paper_id)
+        if cached and cached[0] == _analysis_fingerprint(paper, settings):
+            reused_analysis_ids.add(paper.paper_id)
+            _, full_text_status, analysis, sources = cached
+            return paper.model_copy(update={"full_text_status": full_text_status}), analysis, sources, []
         pages = []
         errors = []
+        partial_full_text = False
         if paper.pdf_url:
             pdf = download_pdf(paper.pdf_url, paper.paper_id, settings)
             if pdf.ok:
                 pages = [{"page": p.page, "text": p.text} for p in pdf.pages]
+                partial_full_text = pdf.truncated
+                if pdf.error:
+                    errors.append(pdf.error)
             elif pdf.error:
                 errors.append(pdf.error)
-        result = analyzer.run(paper, pages or None)
+        result = analyzer.run(paper, pages or None, partial_full_text=partial_full_text)
         paper = paper.model_copy(update={
-            "full_text_status": "full-text" if pages else ("abstract-only" if paper.abstract else "failed")
+            "full_text_status": ("partial-full-text" if partial_full_text else "full-text") if pages else ("abstract-only" if paper.abstract else ("failed" if errors else "metadata-only"))
         })
         return paper, result, pages, errors
 
@@ -116,6 +154,7 @@ def build_workflow(
                 "events": [running, event("Paper Analysis", "Completed", started, "No papers were available to analyze.")],
             }
         output = []
+        reused_analysis_ids.clear()
         with ThreadPoolExecutor(max_workers=min(4, len(papers))) as pool:
             futures = {pool.submit(analyze_one, paper): paper for paper in papers}
             for future in as_completed(futures):
@@ -125,7 +164,7 @@ def build_workflow(
                 except Exception as exc:
                     log.exception("Paper analysis failed for %s", source.paper_id)
                     output.append((source.model_copy(update={"full_text_status": "failed"}), PaperAnalysis(
-                        paper_id=source.paper_id, analysis_mode="abstract-only",
+                        paper_id=source.paper_id, analysis_mode="abstract-only" if source.abstract else "metadata-only",
                         objective="Not reported in accessible text.", problem_statement="Not reported in accessible text.",
                         methodology="Not reported in accessible text.", algorithm_model="Not reported in accessible text.", computational_complexity="Not reported in accessible text.",
                         dataset="Not reported in accessible text.", experimental_setup="Not reported in accessible text.",
@@ -134,7 +173,8 @@ def build_workflow(
                         future_work="Not reported in accessible text.", contributions="Not reported in accessible text.",
                         error=f"{type(exc).__name__}: {exc}",
                     ), [], [str(exc)]))
-        output.sort(key=lambda x: x[0].relevance_score, reverse=True)
+        by_paper_id = {item[0].paper_id: item for item in output}
+        output = [by_paper_id[paper.paper_id] for paper in papers if paper.paper_id in by_paper_id]
         updated_papers = [x[0] for x in output]
         analyses = [x[1] for x in output]
         chunks = []
@@ -146,14 +186,14 @@ def build_workflow(
         rag_errors = []
         if chunks:
             try:
-                VectorService(settings).add(chunks)
+                vectors.add(chunks)
             except Exception as exc:
                 # Keyword retrieval remains available and the selected embedding failure is disclosed.
                 rag_errors.append(f"Vector indexing unavailable: {type(exc).__name__}: {exc}")
                 log.info("Vector indexing failed: %s", type(exc).__name__)
         errors = [message for *_, messages in output for message in messages]
         abstract_count = sum(p.full_text_status != "full-text" for p in updated_papers)
-        summary = f"{len(analyses)} papers analyzed in parallel; {len(chunks)} page-aware chunks; {abstract_count} abstract/metadata-only."
+        summary = f"{len(analyses)} papers processed ({len(reused_analysis_ids)} reusable analyses reused); {len(chunks)} page-aware chunks; {abstract_count} abstract/metadata-only."
         if errors:
             summary += f" {len(errors)} PDF access issues."
         return {
@@ -182,9 +222,10 @@ def build_workflow(
             state.get("comparison"), state.get("gaps", []), state.get("start_year"), state.get("end_year"),
         )
         next_revision = revision + 1 if state.get("critique") else revision
+        summary = f"Structured report drafted (revision {next_revision}; deterministic metadata plus validated evidence synthesis)."
         return {
             "report": report, "revision_count": next_revision,
-            "events": [running, event(writer.name, "Completed", started, f"Structured report drafted (revision {next_revision}; template writer).")],
+            "events": [running, event(writer.name, "Completed", started, summary, writer.last_error)],
         }
 
     def critic_node(state: ResearchState) -> dict:
