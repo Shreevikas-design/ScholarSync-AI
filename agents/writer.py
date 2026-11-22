@@ -41,9 +41,15 @@ def _format_analysis(paper: Paper, analysis: PaperAnalysis, cmap: dict[str, str]
     lines = [f"**{paper.title}** {marker} ({status}; {paper.year or 'year not supplied'})."]
     for name in ("objective", "methodology", "algorithm_model", "computational_complexity", "dataset", "sensor_types", "feature_extraction", "metrics", "results", "contributions", "limitations", "future_work"):
         value = getattr(analysis, name)
-        if value != "Not reported in accessible text.":
-            suffix = f" {marker}" if any(e.field == name for e in analysis.evidence) else ""
-            lines.append(f"- {name.replace('_', ' ').capitalize()}: {value}{suffix}")
+        evidence = next((
+            item for item in analysis.evidence
+            if item.paper_id == paper.paper_id and item.field == name and item.quote.strip()
+        ), None)
+        # Do not publish a populated extraction as a report claim unless it has a
+        # field-matched, paper-matched evidence span and a valid corpus citation.
+        if value != "Not reported in accessible text." and evidence and marker:
+            location = f" (p. {evidence.page})" if evidence.page else ""
+            lines.append(f"- {name.replace('_', ' ').capitalize()}: {value}{location} {marker}")
     return "\n".join(lines)
 
 
@@ -59,10 +65,13 @@ class LiteratureReviewWriter:
     @staticmethod
     def _claim_text(claim: SynthesisClaim, papers: dict[str, Paper], cmap: dict[str, str]) -> str:
         refs = list(dict.fromkeys(cmap[item.paper_id] for item in claim.evidence if item.paper_id in papers and item.paper_id in cmap))
-        return claim.text.rstrip() + (" " + " ".join(refs) if refs else "")
+        text = " ".join(claim.text.split())
+        text = re.sub(r"^(?:[-*•]\s+|\d+[.)]\s+)", "", text)
+        return text + (" " + " ".join(refs) if refs else "")
 
     def _synthesize(
         self, topic: str, records: list[Paper], by_id: dict[str, PaperAnalysis],
+        revision_feedback: list[str] | None = None,
     ) -> SynthesisDraft | None:
         self.last_error = None
         if not self.llm or self.llm.settings.provider == "template" or not records:
@@ -107,6 +116,9 @@ class LiteratureReviewWriter:
             "Do not return citation numbers, outside facts, invented findings, or unsupported generalizations. "
             "Only make cross-paper claims when at least two distinct papers support them. Future directions "
             "must follow reported future-work evidence or be framed as a question. Keep claims concise.\n\n"
+            + ("Previous critic feedback to address while preserving these evidence constraints:\n"
+               + "\n".join(f"- {message[:400]}" for message in revision_feedback) + "\n\n"
+               if revision_feedback else "")
             + "\n\n".join(lines)
         )
         cache_key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -169,6 +181,7 @@ class LiteratureReviewWriter:
     def run(
         self, topic: str, plan: ResearchPlan, papers: list[Paper], analyses: list[PaperAnalysis],
         comparison: ComparativeAnalysis, gaps: list[ResearchGap], start_year: int | None, end_year: int | None,
+        revision_feedback: list[str] | None = None,
     ) -> LiteratureReport:
         cmap = citation_map(papers)
         by_id = {a.paper_id: a for a in analyses}
@@ -189,7 +202,7 @@ class LiteratureReviewWriter:
                 theme = "Other reported methods and objectives"
             theme_groups.setdefault(theme, []).append(_format_analysis(paper, analysis, cmap))
         themed = "\n\n".join("### " + theme + "\n\n" + "\n\n".join(bodies) for theme, bodies in theme_groups.items())
-        synthesis = self._synthesize(topic, records, by_id)
+        synthesis = self._synthesize(topic, records, by_id, revision_feedback)
         if synthesis:
             paper_lookup = {paper.paper_id: paper for paper in papers}
             generated_themes = []
@@ -235,9 +248,15 @@ class LiteratureReviewWriter:
                 if paper and marker:
                     location = f", p. {span.page}" if span.page else ""
                     snippets.append(f"“{span.quote}” {marker}{location}")
+            referenced_ids = list(dict.fromkeys(
+                [*gap.related_paper_ids, *(span.paper_id for span in gap.supporting_evidence)]
+            ))
+            markers = [cmap[paper_id] for paper_id in referenced_ids if paper_id in cmap]
+            if not markers:
+                continue
             gap_rows.append(
                 f"- **{gap.title}** ({gap.category}; confidence {gap.confidence}; evidence coverage {gap.evidence_coverage:.0%}): {gap.description} "
-                + " ".join(cmap.get(pid, "") for pid in gap.related_paper_ids)
+                + " ".join(markers)
                 + f" Why it matters: {gap.why_it_matters} Proposed direction: {gap.proposed_direction} "
                 + ("Supporting evidence: " + "; ".join(snippets) if snippets else "No supporting quote was available.")
             )

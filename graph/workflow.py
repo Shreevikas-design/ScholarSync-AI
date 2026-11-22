@@ -220,6 +220,8 @@ def build_workflow(
         report = writer.run(
             state["topic"], state["plan"], state.get("papers", []), state.get("analyses", []),
             state.get("comparison"), state.get("gaps", []), state.get("start_year"), state.get("end_year"),
+            revision_feedback=[issue.message for issue in getattr(state.get("critique"), "issues", [])
+                               if issue.severity == "error"],
         )
         next_revision = revision + 1 if state.get("critique") else revision
         summary = f"Structured report drafted (revision {next_revision}; deterministic metadata plus validated evidence synthesis)."

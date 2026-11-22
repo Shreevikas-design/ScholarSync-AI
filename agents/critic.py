@@ -36,13 +36,17 @@ class EvidenceCritic:
                         )
                     if not supported:
                         issues.append(CriticIssue(severity="error", message="Evidence quote is not present in the supplied source text.", paper_ids=[analysis.paper_id]))
-        for line in report.markdown.splitlines():
+        report_body = report.markdown.split("## References", 1)[0]
+        for line_number, line in enumerate(report_body.splitlines(), start=1):
             if line.startswith("- ") and not re.search(r"\[\d+\]", line):
-                issues.append(CriticIssue(severity="error", message="A report bullet claim is missing a collected-paper citation."))
+                excerpt = " ".join(line[2:].split())[:220]
+                issues.append(CriticIssue(
+                    severity="error",
+                    message=f"Report bullet on line {line_number} is missing a collected-paper citation: {excerpt}",
+                ))
         invalid = validate_citations(report.markdown, papers)
         if invalid:
             issues.append(CriticIssue(severity="error", message="Report contains citation numbers without a matching collected paper: " + ", ".join(sorted(set(invalid)))))
-        report_body = report.markdown.split("## References", 1)[0]
         missing_refs = [f"[{i}]" for i in range(1, len(papers) + 1) if f"[{i}]" not in report_body]
         if papers and missing_refs:
             issues.append(CriticIssue(severity="error", message="Some collected references are not cited in the report body: " + ", ".join(missing_refs)))

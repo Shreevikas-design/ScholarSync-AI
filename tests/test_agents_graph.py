@@ -212,6 +212,38 @@ def test_critic_rejects_quote_absent_from_source(settings_factory, real_paper):
     assert any("not present" in issue.message for issue in result.issues)
 
 
+def test_critic_identifies_uncited_report_bullet(settings_factory, real_paper):
+    settings = settings_factory()
+    analysis = PaperAnalyzer(settings, LLMService(settings)).run(real_paper)
+    plan = heuristic_plan("Wi-Fi access point placement", 2011, 2026)
+    comparison = ComparativeAnalyst().run([real_paper], [analysis])
+    report = LiteratureReviewWriter().run(
+        "Wi-Fi access point placement", plan, [real_paper], [analysis], comparison, [], 2011, 2026,
+    )
+    markdown = report.markdown.replace(
+        "## References", "- This sentence deliberately has no citation.\n\n## References", 1,
+    )
+    bad_report = report.model_copy(update={"markdown": markdown})
+    critique = EvidenceCritic().run(bad_report, [real_paper], [analysis])
+    issue = next(item for item in critique.issues if "deliberately has no citation" in item.message)
+    assert "line" in issue.message
+
+
+def test_writer_does_not_render_analysis_fields_without_matching_evidence(real_paper):
+    from agents.writer import _format_analysis
+    from services.citation_service import citation_map
+
+    settings = __import__("config").Settings(provider="template")
+    analysis = PaperAnalyzer(settings, LLMService(settings)).run(real_paper)
+    unsupported = analysis.model_copy(update={
+        "methodology": "An unsupported extracted claim.",
+        "evidence": [],
+    })
+    rendered = _format_analysis(real_paper, unsupported, citation_map([real_paper]))
+    assert "unsupported extracted claim" not in rendered
+    assert not any(line.startswith("- ") for line in rendered.splitlines())
+
+
 def _run_graph(monkeypatch, settings_factory, real_paper, critic_class=None):
     import graph.workflow as workflow
     class FakeVector:
@@ -269,12 +301,26 @@ def test_graph_reuses_analysis_when_paper_fingerprint_matches(monkeypatch, setti
 
 
 def test_critic_revision_loop_is_capped_at_two(monkeypatch, settings_factory, real_paper):
+    import graph.workflow as workflow
+
     class AlwaysReject:
         name = "Evidence Critic"
         def run(self, *args):
             return Critique(accepted=False, issues=[CriticIssue(severity="error", message="forced test condition")])
+
+    class RecordingWriter(LiteratureReviewWriter):
+        feedback = []
+
+        def run(self, *args, revision_feedback=None, **kwargs):
+            self.feedback.append(revision_feedback)
+            return super().run(*args, revision_feedback=revision_feedback, **kwargs)
+
+    monkeypatch.setattr(workflow, "LiteratureReviewWriter", RecordingWriter)
     state, events = _run_graph(monkeypatch, settings_factory, real_paper, AlwaysReject)
     writer_runs = [e for e in events if e.agent == "Literature Review Writer" and e.status == "Completed"]
     assert len(writer_runs) == 3
     assert state["revision_count"] == 2
     assert not state["critique"].accepted
+    assert RecordingWriter.feedback[0] == []
+    assert RecordingWriter.feedback[1] == ["forced test condition"]
+    assert RecordingWriter.feedback[2] == ["forced test condition"]
